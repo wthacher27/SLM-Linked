@@ -1,0 +1,6 @@
+.venv/
+ckpt/
+ckpt.pt
+data/
+__pycache__/
+*.pyc
