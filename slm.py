@@ -6,7 +6,7 @@
   python slm.py generate "Just got promoted to Senior Engineer"
   python slm.py test                             # self-check
 """
-import collections, json, pathlib, random, re, shutil, sys, unicodedata
+import collections, json, pathlib, random, re, shutil, subprocess, sys, unicodedata
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM, get_cosine_schedule_with_warmup
 
@@ -76,9 +76,18 @@ SOURCES = [  # HF datasets that really do hold English LinkedIn post text (surve
     'https://raw.githubusercontent.com/harsh-jos/gemma-SFT-linkedin/main/data/final_dataset.jsonl',  # ~150 posts
 ]
 
+KAGGLE_SOURCES = [  # needs ~/.kaggle/kaggle.json (kaggle.com -> Settings -> API); this is most of the corpus
+    'shreyasajal/linkedin-influencers-data',           # ~24k real influencer posts, 91MB
+    'mozharovartem/english-linkedin-posts',            # ~170k english<->linkedin-speak pairs, 82MB
+    'moeinaminifard/1600-posts-on-linkedin',
+    'themeghnasahu/linkedin-company-posts',
+    'logiover/linkedin-top-content-scraper-data',
+    'sreevaatsavbavana/layoffs-linkedin-posts',
+]
+
 
 def fetch(dst='data/raw'):
-    """Pull SOURCES into data/raw/ as jsonl; prep turns them into training data."""
+    """Pull SOURCES + KAGGLE_SOURCES into data/raw/; prep turns them into training data."""
     from datasets import load_dataset
     pathlib.Path(dst).mkdir(parents=True, exist_ok=True)
     for name in SOURCES:
@@ -96,6 +105,21 @@ def fetch(dst='data/raw'):
             print(f'{f.name}: {len(df)} rows')
         except Exception as e:
             print(f'skip {name}: {type(e).__name__} {e}')
+
+    if not pathlib.Path('~/.kaggle/kaggle.json').expanduser().exists():
+        print('no ~/.kaggle/kaggle.json: skipping KAGGLE_SOURCES (kaggle.com -> Settings -> API -> Create New Token)')
+        return
+    for ref in KAGGLE_SOURCES:
+        marker = pathlib.Path(dst, '.kg_' + ref.replace('/', '_'))
+        if marker.exists():
+            print(f'have {ref}'); continue
+        r = subprocess.run(['kaggle', 'datasets', 'download', '-d', ref, '-p', dst, '--unzip', '-q'],
+                           capture_output=True, text=True, timeout=900)
+        if r.returncode == 0:
+            marker.touch()
+            print(f'{ref}: downloaded')
+        else:
+            print(f'skip {ref}: {(r.stderr or r.stdout).strip()[:150]}')
 
 
 def clean(t):
