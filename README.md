@@ -2,9 +2,9 @@
 
 A small language model that writes LinkedIn posts from a prompt, trained from scratch.
 
-No pretrained weights and no pretrained tokenizer: a randomly initialized Llama
-(~10M params, 6 layers, 512-token context) reading raw UTF-8 bytes, so it learns
-everything — spelling included — from the posts you give it.
+No pretrained weights: a randomly initialized Llama (~13M params, 6 layers) with its
+own byte-level BPE tokenizer (8k vocab, trained on its own posts) — it learns
+everything, spelling included, from the data you give it.
 
 ## Setup
 
@@ -12,27 +12,42 @@ everything — spelling included — from the posts you give it.
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
+For the Kaggle-sourced data (most of the corpus): kaggle.com → Settings → API →
+Create New Token, then `mkdir -p ~/.kaggle && mv ~/Downloads/kaggle.json ~/.kaggle/
+&& chmod 600 ~/.kaggle/kaggle.json`. Without it, `fetch` still pulls the smaller
+HuggingFace/GitHub sources.
+
 ## Use
 
 ```bash
-.venv/bin/python slm.py prep                            # data/raw/* -> data/posts.jsonl
-.venv/bin/python slm.py train data/posts.jsonl 5000     # ~70 min for 5k iters on an M-series Mac
+.venv/bin/python slm.py fetch                           # download sources -> data/raw/
+.venv/bin/python slm.py prep                             # data/raw/* -> data/posts.jsonl
+.venv/bin/python slm.py train data/posts.jsonl 5000      # trains its own tokenizer first
 .venv/bin/python slm.py generate "Write a short post about finishing a bootcamp"
-.venv/bin/python slm.py test                            # self-check
+.venv/bin/python slm.py test                             # self-check
 ```
 
-`train` also takes a HuggingFace dataset name directly, e.g.
-`.venv/bin/python slm.py train sanjayram-a/linkedin_posts`.
+Best-validation checkpoint lands in `ckpt/`, with its matching `tokenizer.json`
+copied alongside it (a checkpoint and its tokenizer are useless apart).
 
-Best-validation checkpoint lands in `ckpt/`.
+`data/`, `ckpt/` and `.venv/` are gitignored — rebuild them with the commands
+above rather than committing them; `data/posts.jsonl` alone is ~90MB.
 
 ## Data
 
-`slm.py prep` folds every `.csv`, `.json`, `.jsonl`, `.tsv` and `.parquet` under
-`data/raw/` into one file. It picks each file's free-text column automatically
-(the one with the longest average string), strips links and "…see more", drops
-posts under 100 or over 6000 characters, drops non-English and near-duplicate
-posts, and uses each post's first line as its prompt.
+`slm.py fetch` downloads every dataset in `SOURCES` (HuggingFace + a couple of raw
+URLs) and `KAGGLE_SOURCES` (needs the token above) into `data/raw/`.
+
+`slm.py prep` then folds every `.csv`/`.json`/`.jsonl`/`.tsv`/`.parquet` under
+`data/raw/` into one `data/posts.jsonl`. It picks each file's post-text column
+automatically (preferring a post-shaped name, falling back to the longest
+average string; skips JSON/URL columns), NFKC-normalizes fancy Unicode,
+strips links and "…see more", drops posts under 100 or over 6000 characters,
+drops non-English and near-duplicate posts. For the prompt it uses a real
+prompt/instruction column when the file has one, else the post's hashtags as
+a topic ("Write a LinkedIn post about ai, hiring"), else the post's own hook.
+A few files whose real columns can't be guessed by name are listed explicitly
+in `COLS`.
 
 Training data format, one JSON object per line:
 
@@ -40,25 +55,25 @@ Training data format, one JSON object per line:
 {"prompt": "finishing a bootcamp", "post": "Some personal news 🎉\n\nAfter 6 months..."}
 ```
 
-Sources surveyed (only the first is in use so far):
+Current corpus: **~199k posts, 76MB**, roughly half topic-style prompts and
+half real/hook prompts. Kaggle's `mozharovartem/english-linkedin-posts`
+(plain-English ↔ LinkedIn-speak pairs) is 85% of it, so the corpus currently
+skews toward that dataset's machine-generated corporate voice; the influencer
+and scraped sources are the more authentic human-voice slice.
 
-| rows | size | source |
-|---|---|---|
-| 2,560 | 2.7MB | `sanjayram-a/linkedin_posts` (HF) — **in use**; templated prompts, mostly certificate/internship posts |
-| 1,035 | 1.1MB | `BrianClone/linkedin_posts` (HF) |
-| 156 | 0.6MB | `Greich/linkedin_posts` (HF) |
-
-Skipped: `LakshayRahal/linkedin-llama2-dataset` — 992 posts generated from only
-93 unique sentences, so it teaches memorization rather than style.
-
-**Data is the bottleneck.** ~4MB is enough to learn LinkedIn cadence and real
-words, not enough for meaning. 20MB+ is where a model this size starts making
-sense. Do not scrape LinkedIn directly — it breaks their ToS. Use published
-dumps (Kaggle, HF) or a licensed API.
+Kaggle and HF have both been swept fairly exhaustively for English LinkedIn
+*post* text (not job listings, not profile data) — see `SOURCES` /
+`KAGGLE_SOURCES` for what survived. Beyond this, more data means a licensed
+scraping API (Bright Data, Apify, ...) or personal/team LinkedIn exports.
+Do not scrape LinkedIn directly — it breaks their ToS.
 
 ## Notes
 
-- Byte-level is the right call under ~5MB. Past that, train a byte-level BPE
-  tokenizer (~8k vocab) with HF `tokenizers`: ~4x more text fits the context
-  window and the model stops learning spelling from scratch.
-- Posts longer than the 512-byte context get truncated during generation.
+- 76MB of data is enough for the model to produce real English; below ~20MB
+  expect LinkedIn-flavored word salad instead of coherent posts.
+- Training pads each batch to a bucketed width (64/128/256/384/512 tokens),
+  not to a fixed max — padding every batch to its own exact width thrashes
+  MPS's memory allocator over a long run (fills swap, brings the run to a
+  crawl). Bucketing keeps the shape count small enough to cache.
+- Early stopping: training halts after 3 evals (750 iters) with no
+  validation improvement.
