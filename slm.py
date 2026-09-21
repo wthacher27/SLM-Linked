@@ -113,7 +113,9 @@ def fetch(dst='data/raw'):
         marker = pathlib.Path(dst, '.kg_' + ref.replace('/', '_'))
         if marker.exists():
             print(f'have {ref}'); continue
-        r = subprocess.run(['kaggle', 'datasets', 'download', '-d', ref, '-p', dst, '--unzip', '-q'],
+        kaggle_bin = pathlib.Path(sys.executable).with_name('kaggle')  # not 'kaggle': PATH may not have .venv/bin
+        r = subprocess.run([str(kaggle_bin) if kaggle_bin.exists() else 'kaggle',
+                            'datasets', 'download', '-d', ref, '-p', dst, '--unzip', '-q'],
                            capture_output=True, text=True, timeout=900)
         if r.returncode == 0:
             marker.touch()

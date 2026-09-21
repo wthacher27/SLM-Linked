@@ -1,4 +1,8 @@
 torch
 transformers
+tokenizers
 datasets
+pandas
 numpy
+requests
+kaggle
