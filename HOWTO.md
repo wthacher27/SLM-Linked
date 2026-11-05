@@ -107,6 +107,19 @@ single post. From random init it starts right at ~8.99.
 
 Loads `ckpt/` (model + its matching tokenizer) and samples a post.
 
+## 8. Evaluate
+
+```bash
+.venv/bin/python slm.py eval ckpt my-change
+```
+
+Samples 100 posts (25 fixed prompts x 4) and scores them: on topic, finished,
+repeated trigrams, median words (see README's Evaluating section). Takes under
+a minute on a GPU.
+
+Check: prints one score line and appends a row to `evals/scores.md`. Compare
+it with the `baseline` row there before keeping a change.
+
 ## Rebuild order if something's out of sync
 
 `fetch` → `prep` → `pretrain` → `train` → `generate`, always in that order —

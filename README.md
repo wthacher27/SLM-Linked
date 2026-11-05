@@ -27,6 +27,7 @@ HuggingFace/GitHub sources.
 .venv/bin/python slm.py pretrain 30000                   # general English -> pre/ (fits the tokenizer)
 .venv/bin/python slm.py train data/posts.jsonl 20000     # fine-tunes pre/ on the posts -> ckpt/
 .venv/bin/python slm.py generate "Write a short post about finishing a bootcamp"
+.venv/bin/python slm.py eval ckpt my-change              # 100 samples, scored -> evals/my-change.md
 .venv/bin/python slm.py test                             # self-check
 ```
 
@@ -76,6 +77,23 @@ Kaggle and HF have both been swept fairly exhaustively for English LinkedIn
 `KAGGLE_SOURCES` for what survived. Beyond this, more data means a licensed
 scraping API (Bright Data, Apify, ...) or personal/team LinkedIn exports.
 Do not scrape LinkedIn directly — it breaks their ToS.
+
+## Evaluating
+
+Val loss says how well the model predicts posts, not whether it writes about
+what you asked. `slm.py eval [ckpt] [name]` samples 4 posts for each of 25
+fixed prompts in `EVAL` (phrased the way people actually ask), with fixed
+seeds, so re-running one checkpoint reproduces its samples exactly. Each post
+is scored on:
+
+- **on topic**: matches that prompt's topic regex (e.g. `laid off|layoff`)
+- **finished**: ended on its own instead of running into the context limit
+- **repeated trigrams**: share of word trigrams seen earlier in the post (loops)
+- **median words**
+
+All samples go to `evals/<name>.md`; one score row per run is appended to
+`evals/scores.md`, the table to compare changes against. With 100 samples per
+run, on-topic gaps under ~10 points are sampling noise.
 
 ## Notes
 

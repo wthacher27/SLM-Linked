@@ -5,9 +5,10 @@
   python slm.py pretrain [iters]                 # general English first (streams ~1GB of FineWeb-Edu) -> pre/
   python slm.py train data/posts.jsonl [iters]   # lines of {"prompt": "...", "post": "..."}; starts from pre/
   python slm.py generate "Just got promoted to Senior Engineer"
+  python slm.py eval [ckpt] [name]               # fixed prompts -> evals/<name>.md, scores -> evals/scores.md
   python slm.py test                             # self-check
 """
-import collections, json, pathlib, random, re, shutil, subprocess, sys, unicodedata
+import collections, datetime, json, pathlib, random, re, shutil, statistics, subprocess, sys, unicodedata
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM, get_cosine_schedule_with_warmup
 
@@ -59,13 +60,96 @@ def decode(ids):
     return tokenizer().decode([i for i in ids if i > POST])
 
 
-def generate(model, prompt, max_new=BLOCK, **kw):
+# byte models repeat; the penalty and top_p matter more than temperature here
+SAMPLE = dict(do_sample=True, temperature=0.9, top_p=0.9, repetition_penalty=1.1)
+
+
+def complete(model, prompt, max_new=BLOCK, n=1, **kw):
+    """n sampled continuations of prompt as token ids; one the model finished on its own ends in END."""
     ids = torch.tensor([encode(prompt)], device=model.device)
     max_new = min(max_new, BLOCK - ids.shape[1])  # no positions past the context window
-    # byte models repeat; the penalty and top_p matter more than temperature here
-    sample = kw or dict(do_sample=True, temperature=0.9, top_p=0.9, repetition_penalty=1.1)
-    out = model.generate(ids, max_new_tokens=max_new, eos_token_id=END, pad_token_id=END, **sample)
-    return decode(out[0, ids.shape[1]:].tolist())
+    out = model.generate(ids, max_new_tokens=max_new, eos_token_id=END, pad_token_id=END,
+                         num_return_sequences=n, **(kw or SAMPLE))
+    return out[:, ids.shape[1]:].tolist()
+
+
+def generate(model, prompt, max_new=BLOCK, **kw):
+    return decode(complete(model, prompt, max_new, **kw)[0])
+
+
+EVAL = [  # (prompt, regex an on-topic post matches): phrased the way people ask, not the way prep's prompts read
+    ('Write a LinkedIn post about finishing a machine learning bootcamp', r'bootcamp|machine learning'),
+    ('Just got promoted to Senior Engineer', r'promot|senior engineer'),
+    ('Announce that I am starting a new job at a startup', r'startup|new (role|job|position|chapter)'),
+    ('Write a LinkedIn post about being laid off', r'laid off|layoff'),
+    ('We are hiring a data scientist, write the post', r'hiring|data scien'),
+    ('Share a leadership lesson I learned from a mistake', r'mistake|fail'),
+    ('Announce the launch of our new budgeting app', r'budget|launch'),
+    ('Write a recap of my talk at a tech conference', r'conference|talk|spoke|speaking|keynote'),
+    ('Celebrating 5 years at my company', r'anniversary|(\d+|five)(st|nd|rd|th)? years?\b'),
+    ('Write a LinkedIn post about getting my AWS certification', r'aws|certif'),
+    ('Thank my team for shipping a big release', r'release|ship|launch'),
+    ('Write a post about finishing my summer internship', r'internship|interns?\b'),
+    ('Write a LinkedIn post about graduating with a computer science degree', r'graduat|degree|computer science'),
+    ('Our startup just closed a seed round', r'seed|funding|raised|investor'),
+    ('Write a LinkedIn post about remote work', r'remote|work from home|hybrid'),
+    ('Write a post about how AI is changing my job as a designer', r'ai\b|artificial intelligence'),
+    ('Write a thank-you post for my mentor', r'mentor'),
+    ('Write about switching careers from teaching to software engineering', r'teach|career (change|switch|pivot)'),
+    ('Write a LinkedIn post about dealing with burnout', r'burn.?out|exhaust|mental health'),
+    ('Share tips for public speaking', r'speak|presentation|audience'),
+    ('Announce that we open-sourced our internal tool', r'open.?source|github'),
+    ('Write a post about volunteering at a food bank', r'volunteer|food'),
+    ('Recommend a book that changed how I think about leadership', r'book|author'),
+    ('Write a customer success story about a client who doubled their revenue', r'client|customer|revenue'),
+    ('Write my farewell post, I am leaving the company after 10 years', r'farewell|goodbye|leaving|last day|moving on'),
+]
+
+
+def repeats(text):
+    """Share of word trigrams that already appeared earlier in text: ~0 for a sane post, high for a loop."""
+    w = re.findall(r'\w+', text.lower())
+    tri = list(zip(w, w[1:], w[2:]))
+    return 1 - len(set(tri)) / len(tri) if tri else 0.0
+
+
+def evaluate(ckpt='ckpt', name=None, n=4):
+    """n samples per EVAL prompt with fixed seeds, scored on staying on topic, finishing on their own and not
+    looping. Val loss can't see any of that. Samples -> evals/<name>.md, one score row -> evals/scores.md."""
+    global _tok
+    _tok = None
+    tokenizer(f'{ckpt}/tokenizer.json')  # the checkpoint's own: ckpt-scratch/ speaks a different one
+    model = LlamaForCausalLM.from_pretrained(ckpt).to(DEV).eval()
+    name = name or f'{pathlib.Path(ckpt).name}-{datetime.date.today()}'
+    rows, body = [], []
+    for i, (prompt, topic) in enumerate(EVAL):
+        torch.manual_seed(i)  # per prompt: re-running one checkpoint reproduces its samples exactly
+        body.append(f'## {i + 1}. {prompt}\n')
+        for ids in complete(model, prompt, n=n):
+            post = decode(ids)
+            r = dict(topic=bool(re.search(rf'\b({topic})', post, re.I)), done=ids[-1] == END,
+                     rep=repeats(post), words=len(post.split()))
+            rows.append(r)
+            body.append(('on topic' if r['topic'] else '**off topic**') + ('' if r['done'] else ', **cut off**')
+                        + f'\n```text\n{post}\n```\n')
+    score = {'on topic': f"{sum(r['topic'] for r in rows) / len(rows):.0%}",
+             'finished': f"{sum(r['done'] for r in rows) / len(rows):.0%}",
+             'repeated trigrams': f"{statistics.mean(r['rep'] for r in rows):.1%}",
+             'median words': f"{statistics.median(r['words'] for r in rows):.0f}"}
+    row = lambda cells: '| ' + ' | '.join(cells) + ' |\n'
+    d = pathlib.Path('evals')
+    d.mkdir(exist_ok=True)
+    (d / f'{name}.md').write_text(
+        f'# {name}\n\n`{ckpt}/` on {DEV}: {len(EVAL)} prompts x {n} samples, seeds 0-{len(EVAL) - 1}, '
+        f'sampling `{SAMPLE}`\n\n' + row(score) + row(['---'] * len(score)) + row(score.values()) + '\n'
+        + '\n'.join(body), encoding='utf-8')
+    log = d / 'scores.md'
+    if not log.exists():  # with ~100 samples a run, gaps under ~10 points are sampling noise
+        log.write_text(row(['run', *score]) + row(['---'] * (len(score) + 1)), encoding='utf-8')
+    with open(log, 'a', encoding='utf-8') as fh:
+        fh.write(row([f'[{name}]({name}.md)', *score.values()]))
+    print(f'{name}: ' + ', '.join(f'{k} {v}' for k, v in score.items()) + f' -> {d / name}.md')
+    return score
 
 
 SOURCES = [  # HF datasets that really do hold English LinkedIn post text (surveyed 2026-09)
@@ -405,6 +489,10 @@ def test():
             opt.zero_grad(); loss.backward(); opt.step()
         out = generate(model, 'promo', max_new=60, do_sample=False)
         assert out == 'I am thrilled to announce...', repr(out)
+        assert complete(model, 'promo', max_new=60, do_sample=False)[0][-1] == END  # stopped on its own
+
+    # eval: a looping post scores high on repeats, a sane one zero
+    assert repeats('a b c a b c a b c') > 0.5 and repeats('one two three four') == 0
     _tok = None
     print('ok')
 
@@ -421,6 +509,8 @@ if __name__ == '__main__':
         fetch(*sys.argv[2:])
     elif cmd == 'prep':
         prep(*sys.argv[2:])
+    elif cmd == 'eval':
+        evaluate(*sys.argv[2:])
     elif cmd == 'test':
         test()
     else:
