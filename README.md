@@ -3,8 +3,10 @@
 A small language model that writes LinkedIn posts from a prompt, trained from scratch.
 
 No pretrained weights: a randomly initialized Llama (~13M params, 6 layers) with its
-own byte-level BPE tokenizer (8k vocab, trained on its own posts) — it learns
-everything, spelling included, from the data you give it.
+own byte-level BPE tokenizer (8k vocab, trained on its own data) — it learns
+everything, spelling included, from the data you give it. It learns in two stages:
+general English first (~1GB of FineWeb-Edu, since ~20M tokens of posts is too
+little to learn a language from), then LinkedIn posts.
 
 ## Setup
 
@@ -22,15 +24,23 @@ HuggingFace/GitHub sources.
 ```bash
 .venv/bin/python slm.py fetch                           # download sources -> data/raw/
 .venv/bin/python slm.py prep                             # data/raw/* -> data/posts.jsonl
-.venv/bin/python slm.py train data/posts.jsonl 5000      # trains its own tokenizer first
+.venv/bin/python slm.py pretrain 30000                   # general English -> pre/ (fits the tokenizer)
+.venv/bin/python slm.py train data/posts.jsonl 20000     # fine-tunes pre/ on the posts -> ckpt/
 .venv/bin/python slm.py generate "Write a short post about finishing a bootcamp"
 .venv/bin/python slm.py test                             # self-check
 ```
 
-Best-validation checkpoint lands in `ckpt/`, with its matching `tokenizer.json`
-copied alongside it (a checkpoint and its tokenizer are useless apart).
+(On Windows: `.venv\Scripts\python.exe` instead of `.venv/bin/python`, and set
+`$env:PYTHONUTF8=1` first or printing an emoji crashes `generate`.)
 
-`data/`, `ckpt/` and `.venv/` are gitignored — rebuild them with the commands
+`pretrain` streams ~1GB of FineWeb-Edu into `data/pretrain.jsonl` on its first
+run. Without `pre/`, `train` falls back to the old behavior: random init and a
+tokenizer fit to the posts alone.
+
+Best-validation checkpoints land in `pre/` and `ckpt/`, each with its matching
+`tokenizer.json` copied alongside it (a checkpoint and its tokenizer are useless apart).
+
+`data/`, `pre/`, `ckpt/` and `.venv/` are gitignored — rebuild them with the commands
 above rather than committing them; `data/posts.jsonl` alone is ~90MB.
 
 ## Data
@@ -75,5 +85,5 @@ Do not scrape LinkedIn directly — it breaks their ToS.
   not to a fixed max — padding every batch to its own exact width thrashes
   MPS's memory allocator over a long run (fills swap, brings the run to a
   crawl). Bucketing keeps the shape count small enough to cache.
-- Early stopping: training halts after 3 evals (750 iters) with no
+- Early stopping: training halts after 6 evals (1500 iters) with no
   validation improvement.

@@ -2,7 +2,8 @@
 
   python slm.py fetch                            # download the curated HF sources -> data/raw/
   python slm.py prep                             # data/raw/* -> data/posts.jsonl
-  python slm.py train data/posts.jsonl [iters]   # lines of {"prompt": "...", "post": "..."}
+  python slm.py pretrain [iters]                 # general English first (streams ~1GB of FineWeb-Edu) -> pre/
+  python slm.py train data/posts.jsonl [iters]   # lines of {"prompt": "...", "post": "..."}; starts from pre/
   python slm.py generate "Just got promoted to Senior Engineer"
   python slm.py test                             # self-check
 """
@@ -18,6 +19,9 @@ CFG = dict(vocab_size=VOCAB, hidden_size=384, intermediate_size=1024, num_hidden
            bos_token_id=PROMPT, eos_token_id=END, pad_token_id=END,
            attention_dropout=0.1)  # ~13M params; dropout won the size sweep
 DEV = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+# ~20M tokens of posts is too little to learn English from, so pretrain on general text first.
+# Still from scratch: this is training data, not pretrained weights.
+PRETRAIN = ('HuggingFaceFW/fineweb-edu', 'sample-10BT')
 _tok = None
 
 
@@ -144,9 +148,16 @@ COLS = {  # files whose real (post, prompt) columns the name heuristic cannot gu
 }
 
 
-def prep(src='data/raw', out='data/posts.jsonl', min_chars=100, max_chars=6000):
+def related(prompt, post):
+    """True if the prompt shares a content word (5-char prefix match) with the post."""
+    stem = lambda t: {w[:5] for w in re.findall(r'[a-z]{4,}', t.lower())}
+    return bool(stem(prompt) & stem(post))
+
+
+def prep(src='data/raw', out='data/posts.jsonl', min_chars=100, max_chars=6000, max_per_prompt=5):
     """Fold every csv/json/jsonl/parquet under src into one deduped posts.jsonl."""
     import pandas as pd
+    per_prompt = collections.Counter()
     reader = {'.csv': pd.read_csv, '.tsv': lambda p: pd.read_csv(p, sep='\t'),
               '.json': pd.read_json, '.jsonl': lambda p: pd.read_json(p, lines=True),
               '.parquet': pd.read_parquet}
@@ -180,18 +191,24 @@ def prep(src='data/raw', out='data/posts.jsonl', min_chars=100, max_chars=6000):
         n = 0
         for raw, praw in zip(df[col], df[pcol] if pcol else df[col]):
             post = clean(raw)
-            key = re.sub(r'\W+', '', post.lower())[:300]
-            if min_chars <= len(post) <= max_chars and english(post) and key not in seen:
-                seen.add(key)
+            norm = re.sub(r'\W+', '', post.lower())
+            key, tail = norm[:300], norm[-120:]                   # same opening or same ending = near-duplicate
+            if min_chars <= len(post) <= max_chars and english(post) and key not in seen and tail not in seen:
                 p = clean(praw) if pcol else ''
                 # boilerplate, JSON config blobs and "unknown" placeholders teach nothing. Fall back to
                 # the post's hashtags as a topic prompt, else its hook -- a prefix-only prompt would
                 # teach the model to continue text rather than write a post from an instruction.
-                if not p or p.startswith('{') or 'unknown' in p.lower() or dupes[str(praw)] > 3:
+                # A prompt sharing no content word with its post is a mismatched pair: same fallback.
+                if not p or p.startswith('{') or 'unknown' in p.lower() or dupes[str(praw)] > 3 or not related(p, post):
                     tags = re.findall(r'#(\w+)', post)[:3]
                     p = ('Write a LinkedIn post about ' + ', '.join(t.lower() for t in tags)
                          if tags else post.split('\n')[0][:80])
-                kept.append({'prompt': p[:120], 'post': post})
+                p = p[:120]
+                if per_prompt[p] >= max_per_prompt:               # one account's hashtag prompt must not dominate
+                    continue
+                per_prompt[p] += 1
+                seen.update((key, tail))
+                kept.append({'prompt': p, 'post': post})
                 n += 1
         print(f'{f.name}: {n} posts from {col!r}' + (f', prompts from {pcol!r}' if pcol else ''))
     pathlib.Path(out).parent.mkdir(parents=True, exist_ok=True)
@@ -226,12 +243,22 @@ def batch_of(exs, batch):
     return x.to(DEV), y.to(DEV)
 
 
-def train(path, iters=5000, cfg=CFG, batch=16, lr=3e-4, out='ckpt'):
+def train(path, iters=5000, cfg=CFG, batch=16, lr=3e-4, out='ckpt', init='pre'):
+    """Fine-tune the pretrained model in init/ (see pretrain) on prompt -> post pairs. Without one,
+    start from random init with a fresh tokenizer fit to these posts alone."""
     rows = load_rows(path)
     random.Random(0).shuffle(rows)  # else the val split is whichever source landed last
-    cfg = cfg | dict(vocab_size=train_tokenizer(rows))  # fresh tokenizer for this corpus
+    pre = init and pathlib.Path(init, 'config.json').exists()
+    if pre:
+        tok = f'{init}/tokenizer.json'  # the pretrained model only speaks the tokenizer it learned with
+    else:
+        cfg = cfg | dict(vocab_size=train_tokenizer(rows))  # fresh tokenizer for this corpus
+        tok = TOK_PATH
+    global _tok
+    _tok = None
+    tokenizer(tok)  # explicitly: tokenizer() would otherwise pick up an older ckpt/'s
     pathlib.Path(out).mkdir(parents=True, exist_ok=True)
-    shutil.copy(TOK_PATH, f'{out}/tokenizer.json')      # keep them together, they must match
+    shutil.copy(tok, f'{out}/tokenizer.json')  # keep them together, they must match
     exs = [(ids, len(encode(r.get('prompt', ''))))
            for r in rows for ids in [encode(r.get('prompt', ''), r['post'])[:BLOCK]]]
     exs = [e for e in exs if e[1] < len(e[0])]  # keep only examples with post bytes left after truncation
@@ -239,31 +266,36 @@ def train(path, iters=5000, cfg=CFG, batch=16, lr=3e-4, out='ckpt'):
     tr, va = exs[:n], exs[n:]
     assert len(va) > batch, f'need more data: val split has {len(va)} examples'
 
-    def get(split):
-        return batch_of(split, batch)
+    model = (LlamaForCausalLM.from_pretrained(init) if pre else LlamaForCausalLM(LlamaConfig(**cfg))).to(DEV)
+    print(f'{len(exs)} examples ({sum(len(i) for i, _ in exs):,} tokens), '
+          f'{model.num_parameters() / 1e6:.1f}M params on {DEV}, ' + (f'from {init}/' if pre else 'random init'))
+    # the same ~1000 val posts every eval: fresh random ones each time made val loss noisy
+    # enough to trip early stopping while the model was still improving
+    vb = [batch_of(va, batch) for _ in range(64)]
+    return fit(model, lambda: batch_of(tr, batch), vb, iters, lr, out)
 
-    model = LlamaForCausalLM(LlamaConfig(**cfg)).to(DEV)  # random init: nothing pretrained
+
+def fit(model, get, vb, iters, lr, out):
+    """AdamW on a cosine schedule; every 250 iters, eval on the fixed val batches vb and keep the best in out/."""
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
     sched = get_cosine_schedule_with_warmup(opt, 100, iters)
-    print(f'{len(exs)} examples ({sum(len(i) for i, _ in exs):,} bytes), '
-          f'{model.num_parameters() / 1e6:.1f}M params on {DEV}')
     best, stale = float('inf'), 0
     for it in range(iters + 1):
         if it % 250 == 0:
             model.eval()
             with torch.no_grad():
-                val = sum(model(input_ids=x, labels=y).loss.item() for x, y in (get(va) for _ in range(20))) / 20
+                val = sum(model(input_ids=x, labels=y).loss.item() for x, y in vb) / len(vb)
             model.train()
             print(f'iter {it}  val loss {val:.3f}')
-            if val < best:  # ponytail: best-val checkpoint only, no resume; add optimizer state if runs get long
+            if val < best:  # ponytail: best-val weights only, no optimizer state; pretrain resumes from weights alone
                 best, stale = val, 0
                 model.save_pretrained(out)
             else:
                 stale += 1
-                if stale == 3:  # 3 evals without improvement: it is overfitting, stop
+                if stale == 6:  # 6 evals (1500 iters) without improvement: it is overfitting, stop
                     print(f'early stop at {it}, best val {best:.3f}')
                     break
-        x, y = get(tr)
+        x, y = get()
         loss = model(input_ids=x, labels=y).loss  # HF shifts labels internally
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -271,6 +303,56 @@ def train(path, iters=5000, cfg=CFG, batch=16, lr=3e-4, out='ckpt'):
         opt.step()
         sched.step()
     return best
+
+
+def fetch_pretrain(dst='data/pretrain.jsonl', mb=1000):
+    """Stream the first ~mb MB of PRETRAIN into dst. 1GB is ~250M tokens, about 20 per param: the
+    compute-optimal amount for a model this size."""
+    from datasets import load_dataset
+    n = 0
+    with open(dst + '.part', 'w') as fh:  # renamed at the end: a cut-off download must not pass for a whole one
+        for r in load_dataset(*PRETRAIN, split='train', streaming=True):
+            fh.write(json.dumps({'text': r['text']}) + '\n')
+            n += len(r['text'].encode())
+            if n >= mb * 1e6:
+                break
+    pathlib.Path(dst + '.part').replace(dst)
+    print(f'{n / 1e6:.0f} MB of {PRETRAIN[0]} -> {dst}')
+
+
+def pretrain(iters=30000, src='data/pretrain.jsonl', posts='data/posts.jsonl', out='pre', batch=16, lr=6e-4):
+    """Random init -> next-token prediction on general English, saved to out/; train() starts from it.
+    Run prep first: the tokenizer is fit here, to posts and plain English alike, and both stages share it.
+    If out/ already has a model (a cut-off run), continue from its weights; delete out/ to start over."""
+    import numpy as np
+    if not pathlib.Path(src).exists():
+        fetch_pretrain(src)
+    docs = [json.loads(l)['text'] for l in open(src)]
+    resume = pathlib.Path(out, 'config.json').exists()  # weights only: optimizer and LR schedule start fresh
+    if not resume:
+        vocab = train_tokenizer(load_rows(posts) + [{'post': d} for d in docs[:len(docs) // 10]])
+    # explicitly: tokenizer() would otherwise pick up an older ckpt/'s; resumed weights only speak out/'s
+    t = tokenizer(f'{out}/tokenizer.json' if resume else TOK_PATH)
+    # one long token stream, END between docs; uint16 halves the RAM and the vocab fits
+    ids = np.concatenate([np.array(e.ids + [END], dtype=np.uint16)
+                          for i in range(0, len(docs), 10000) for e in t.encode_batch(docs[i:i + 10000])])
+    del docs
+    n = int(len(ids) * 0.99)
+    tr, va = ids[:n], ids[n:]
+
+    def window(split):  # random full-length windows, cut across doc boundaries: no padding at all
+        ix = torch.randint(len(split) - BLOCK, (batch,)).tolist()
+        x = torch.from_numpy(np.stack([split[i:i + BLOCK] for i in ix]).astype(np.int64)).to(DEV)
+        return x, x  # every token is a target
+
+    model = (LlamaForCausalLM.from_pretrained(out) if resume
+             else LlamaForCausalLM(LlamaConfig(**CFG | dict(vocab_size=vocab)))).to(DEV)
+    print(f'{len(ids):,} tokens, {model.num_parameters() / 1e6:.1f}M params on {DEV}, '
+          + (f'resuming {out}/' if resume else 'random init'))
+    pathlib.Path(out).mkdir(parents=True, exist_ok=True)
+    if not resume:
+        shutil.copy(TOK_PATH, f'{out}/tokenizer.json')
+    return fit(model, lambda: window(tr), [window(va) for _ in range(64)], iters, lr, out)
 
 
 def test():
@@ -331,6 +413,8 @@ if __name__ == '__main__':
     cmd = sys.argv[1] if len(sys.argv) > 1 else ''
     if cmd == 'train':
         train(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 5000)
+    elif cmd == 'pretrain':
+        pretrain(int(sys.argv[2]) if len(sys.argv) > 2 else 30000)
     elif cmd == 'generate':
         print(generate(LlamaForCausalLM.from_pretrained('ckpt').to(DEV), ' '.join(sys.argv[2:])))
     elif cmd == 'fetch':
