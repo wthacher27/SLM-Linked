@@ -28,6 +28,8 @@ HuggingFace/GitHub sources.
 .venv/bin/python slm.py train data/posts.jsonl 20000     # fine-tunes pre/ on the posts -> ckpt/
 .venv/bin/python slm.py generate "Write a short post about finishing a bootcamp"
 .venv/bin/python slm.py eval ckpt my-change              # 100 samples, scored -> evals/my-change.md
+.venv/bin/python app.py                                  # web page + HTTP API on localhost:7860
+.venv/bin/python slm.py deploy you/slm-linked            # the same, on a private Hugging Face Space
 .venv/bin/python slm.py test                             # self-check
 ```
 
@@ -102,6 +104,37 @@ is scored on:
 All samples go to `evals/<name>.md`; one score row per run is appended to
 `evals/scores.md`, the table to compare changes against. With 100 samples per
 run, on-topic gaps under ~10 points are sampling noise.
+
+## Querying remotely
+
+`app.py` wraps `generate` in a Gradio page with an HTTP API (one endpoint,
+`/write`: a prompt and an optional `best_of`, returns the post). `slm.py
+deploy you/slm-linked` uploads it, `slm.py` and `ckpt/` to a Hugging Face Space
+in one commit: free CPU hardware, created private, so only your account can
+use it. First make a token with write access (huggingface.co → Settings →
+Access Tokens) and run `.venv/bin/hf auth login`. Re-run `deploy` after
+retraining to ship the new `ckpt/`; the Space rebuilds in a few minutes.
+
+Then, from anywhere:
+
+- **browser**: `https://huggingface.co/spaces/you/slm-linked`, logged in to
+  Hugging Face (works on a phone)
+- **Python** (`pip install gradio_client`):
+  ```python
+  from gradio_client import Client
+  post = Client('you/slm-linked', token='hf_...').predict(prompt='Just got promoted', api_name='/write')
+  ```
+- **curl**: one call to start, one to read the result:
+  ```bash
+  URL=https://you-slm-linked.hf.space/gradio_api/call
+  ID=$(curl -s -H "Authorization: Bearer $HF_TOKEN" -H 'Content-Type: application/json' \
+       -d '{"prompt": "Just got promoted"}' $URL/v2/write | sed 's/.*"event_id": *"\([^"]*\)".*/\1/')
+  curl -sN -H "Authorization: Bearer $HF_TOKEN" $URL/write/$ID
+  ```
+
+A post takes 1-3 s on two CPU threads at `best_of=16` (my desktop; the
+Space's CPUs may be slower). A free Space sleeps after 48 hours without use;
+opening its page wakes it, which takes a minute or so.
 
 ## Notes
 

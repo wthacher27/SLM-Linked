@@ -124,9 +124,29 @@ a minute on a GPU.
 Check: prints one score line and appends a row to `evals/scores.md`. Compare
 it with the `baseline` row there before keeping a change.
 
+## 9. Serve it
+
+```bash
+.venv/bin/python app.py
+```
+
+Check: http://127.0.0.1:7860 shows a prompt box, and a post comes back in a
+few seconds.
+
+To use it away from this machine, put it on a Hugging Face Space:
+
+1. huggingface.co → Settings → Access Tokens → create one with write access.
+2. `.venv/bin/hf auth login` and paste it.
+3. `.venv/bin/python slm.py deploy <your-username>/slm-linked`
+
+Check: it prints the Space's URL; the page there shows "Building", then the
+same prompt box as locally after a few minutes. The Space is private: open it
+while logged in, or pass the token from step 1 to the API (README's Querying
+remotely section). After retraining, run step 3 again.
+
 ## Rebuild order if something's out of sync
 
-`fetch` → `prep` → `pretrain` → `train` → `generate`, always in that order —
+`fetch` → `prep` → `pretrain` → `train` → `generate` (or `deploy`), always in that order —
 each step's output is the next step's input. If you edit `slm.py`'s
 cleaning/column logic, rerun from `prep`. If you add a new source, rerun from
 `fetch`. To only retune on the posts, rerun `train`: `pre/` stays valid.

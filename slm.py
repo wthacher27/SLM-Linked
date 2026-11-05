@@ -6,6 +6,7 @@
   python slm.py train data/posts.jsonl [iters] [out]  # lines of {"prompt": "...", "post": "..."}; pre/ -> out/ (ckpt/)
   python slm.py generate "Just got promoted to Senior Engineer"
   python slm.py eval [ckpt] [name]               # fixed prompts -> evals/<name>.md, scores -> evals/scores.md
+  python slm.py deploy user/space [ckpt]         # app.py + the model -> a private Hugging Face Space
   python slm.py test                             # self-check
 """
 import collections, datetime, json, math, pathlib, random, re, shutil, statistics, subprocess, sys, unicodedata
@@ -34,6 +35,14 @@ def tokenizer(path=None):
         ck = pathlib.Path('ckpt/tokenizer.json')          # a checkpoint carries its own tokenizer
         _tok = Tokenizer.from_file(path or (str(ck) if ck.exists() else TOK_PATH))
     return _tok
+
+
+def load(ckpt='ckpt'):
+    """The model in ckpt/, switched to the tokenizer saved with it: a checkpoint and its tokenizer must match."""
+    global _tok
+    _tok = None
+    tokenizer(f'{ckpt}/tokenizer.json')
+    return LlamaForCausalLM.from_pretrained(ckpt).to(DEV).eval()
 
 
 def train_tokenizer(rows, path=TOK_PATH, vocab=VOCAB):
@@ -162,11 +171,8 @@ def evaluate(ckpt='ckpt', name=None, n=4, best_of=BEST_OF):
     """n posts per EVAL prompt, each picked from best_of samples the way generate() does, with fixed seeds;
     scored on staying on topic, finishing on their own and not looping. Val loss can't see any of that.
     Posts -> evals/<name>.md, one score row -> evals/scores.md."""
-    global _tok
-    _tok = None
-    tokenizer(f'{ckpt}/tokenizer.json')  # the checkpoint's own: ckpt-scratch/ speaks a different one
-    model = LlamaForCausalLM.from_pretrained(ckpt).to(DEV).eval()
-    name = name or f'{pathlib.Path(ckpt).name}-{datetime.date.today()}'
+    model = load(ckpt)  # with its own tokenizer: ckpt-scratch/ speaks a different one
+    name =name or f'{pathlib.Path(ckpt).name}-{datetime.date.today()}'
     tags = collections.Counter(t.lower() for r in load_rows('data/posts.jsonl') for t in re.findall(r'#(\w+)', r['post']))
     rows, body = [], []
     for i, (prompt, topic) in enumerate(EVAL):
@@ -196,6 +202,19 @@ def evaluate(ckpt='ckpt', name=None, n=4, best_of=BEST_OF):
         fh.write(row([f'[{name}]({name}.md)', *score.values()]))
     print(f'{name}: ' + ', '.join(f'{k} {v}' for k, v in score.items()) + f' -> {d / name}.md')
     return score
+
+
+def deploy(space, ckpt='ckpt'):
+    """Upload app.py, this file and the model in ckpt/ to the Hugging Face Space `space` (user/name) in one
+    commit, creating it private if it is new; the Space then rebuilds and serves app.py. Needs `hf auth login`."""
+    from huggingface_hub import CommitOperationAdd, HfApi
+    api = HfApi()
+    api.create_repo(space, repo_type='space', space_sdk='gradio', private=True, exist_ok=True)
+    files = {'app.py': 'app.py', 'slm.py': 'slm.py', 'README.md': 'space/README.md',  # the Space's own card
+             'requirements.txt': 'space/requirements.txt'} | {f'ckpt/{p.name}': str(p) for p in pathlib.Path(ckpt).iterdir()}
+    api.create_commit(space, [CommitOperationAdd(k, v) for k, v in files.items()], repo_type='space',
+                      commit_message=f'deploy {ckpt}/')
+    print(f'https://huggingface.co/spaces/{space} (building: a minute or two)')
 
 
 SOURCES = [  # HF datasets that really do hold English LinkedIn post text (surveyed 2026-09)
@@ -568,6 +587,10 @@ def test():
         good = encode('promo', 'I am thrilled to announce...')[len(encode('promo')):]
         junk = tokenizer().encode('hi').ids + [END]
         assert pick(model, 'promo', [junk, good + [END, END]]) == good, 'pick must prefer the trained post'
+        # load: a saved checkpoint comes back with its own tokenizer and writes the same post
+        model.save_pretrained(f'{d}/ck')
+        shutil.copy(f'{d}/tok.json', f'{d}/ck/tokenizer.json')
+        assert generate(load(f'{d}/ck'), 'promo', max_new=60, best_of=1, do_sample=False) == out
 
     # eval: a looping post scores high on repeats, a sane one zero
     assert repeats('a b c a b c a b c') > 0.5 and repeats('one two three four') == 0
@@ -587,13 +610,15 @@ if __name__ == '__main__':
     elif cmd == 'pretrain':
         pretrain(int(sys.argv[2]) if len(sys.argv) > 2 else 30000)
     elif cmd == 'generate':
-        print(generate(LlamaForCausalLM.from_pretrained('ckpt').to(DEV), ' '.join(sys.argv[2:])))
+        print(generate(load(), ' '.join(sys.argv[2:])))
     elif cmd == 'fetch':
         fetch(*sys.argv[2:])
     elif cmd == 'prep':
         prep(*sys.argv[2:])
     elif cmd == 'eval':
         evaluate(*sys.argv[2:])
+    elif cmd == 'deploy':
+        deploy(*sys.argv[2:])
     elif cmd == 'test':
         test()
     else:
