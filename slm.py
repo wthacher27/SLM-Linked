@@ -3,12 +3,12 @@
   python slm.py fetch                            # download the curated HF sources -> data/raw/
   python slm.py prep                             # data/raw/* -> data/posts.jsonl
   python slm.py pretrain [iters]                 # general English first (streams ~1GB of FineWeb-Edu) -> pre/
-  python slm.py train data/posts.jsonl [iters]   # lines of {"prompt": "...", "post": "..."}; starts from pre/
+  python slm.py train data/posts.jsonl [iters] [out]  # lines of {"prompt": "...", "post": "..."}; pre/ -> out/ (ckpt/)
   python slm.py generate "Just got promoted to Senior Engineer"
   python slm.py eval [ckpt] [name]               # fixed prompts -> evals/<name>.md, scores -> evals/scores.md
   python slm.py test                             # self-check
 """
-import collections, datetime, json, pathlib, random, re, shutil, statistics, subprocess, sys, unicodedata
+import collections, datetime, json, math, pathlib, random, re, shutil, statistics, subprocess, sys, unicodedata
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM, get_cosine_schedule_with_warmup
 
@@ -141,6 +141,23 @@ def repeats(text):
     return 1 - len(set(tri)) / len(tri) if tri else 0.0
 
 
+def judge(prompt, topic, post, tags):
+    """eval's checks on one post; tags counts each hashtag's uses in the training posts."""
+    words = set(re.findall(r'[a-z]{5,}', prompt.lower())) - {'write', 'linkedin', 'about'}
+    return dict(topic=bool(re.search(rf'\b({topic})', post, re.I)),
+                echo=post.lower().startswith(prompt.lower()[:25]),  # opens by repeating the prompt
+                # a tag coined from the prompt's words (#finishinginternship), not one people actually use
+                coined=any(tags[t.lower()] < 3 and any(w in t.lower() for w in words) for t in re.findall(r'#(\w+)', post)),
+                rep=repeats(post), words=len(post.split()))
+
+
+def summarize(rows):
+    share = lambda k: f'{sum(r[k] for r in rows) / len(rows):.0%}'
+    return {'on topic': share('topic'), 'finished': share('done'), 'echoes prompt': share('echo'),
+            'coined tags': share('coined'), 'repeated trigrams': f"{statistics.mean(r['rep'] for r in rows):.1%}",
+            'median words': f"{statistics.median(r['words'] for r in rows):.0f}"}
+
+
 def evaluate(ckpt='ckpt', name=None, n=4, best_of=BEST_OF):
     """n posts per EVAL prompt, each picked from best_of samples the way generate() does, with fixed seeds;
     scored on staying on topic, finishing on their own and not looping. Val loss can't see any of that.
@@ -150,6 +167,7 @@ def evaluate(ckpt='ckpt', name=None, n=4, best_of=BEST_OF):
     tokenizer(f'{ckpt}/tokenizer.json')  # the checkpoint's own: ckpt-scratch/ speaks a different one
     model = LlamaForCausalLM.from_pretrained(ckpt).to(DEV).eval()
     name = name or f'{pathlib.Path(ckpt).name}-{datetime.date.today()}'
+    tags = collections.Counter(t.lower() for r in load_rows('data/posts.jsonl') for t in re.findall(r'#(\w+)', r['post']))
     rows, body = [], []
     for i, (prompt, topic) in enumerate(EVAL):
         torch.manual_seed(i)  # per prompt: re-running one checkpoint reproduces its samples exactly
@@ -158,15 +176,12 @@ def evaluate(ckpt='ckpt', name=None, n=4, best_of=BEST_OF):
         for j in range(n):
             ids = pick(model, prompt, cands[j * best_of:(j + 1) * best_of])
             post = decode(ids)
-            r = dict(topic=bool(re.search(rf'\b({topic})', post, re.I)), done=ids[-1] == END,
-                     rep=repeats(post), words=len(post.split()))
+            r = judge(prompt, topic, post, tags) | dict(done=ids[-1] == END)
             rows.append(r)
-            body.append(('on topic' if r['topic'] else '**off topic**') + ('' if r['done'] else ', **cut off**')
+            body.append(', '.join(['on topic' if r['topic'] else '**off topic**'] + ['**cut off**'] * (not r['done'])
+                                  + ['**echoes prompt**'] * r['echo'] + ['**coined tag**'] * r['coined'])
                         + f'\n```text\n{post}\n```\n')
-    score = {'on topic': f"{sum(r['topic'] for r in rows) / len(rows):.0%}",
-             'finished': f"{sum(r['done'] for r in rows) / len(rows):.0%}",
-             'repeated trigrams': f"{statistics.mean(r['rep'] for r in rows):.1%}",
-             'median words': f"{statistics.median(r['words'] for r in rows):.0f}"}
+    score = summarize(rows)
     row = lambda cells: '| ' + ' | '.join(cells) + ' |\n'
     d = pathlib.Path('evals')
     d.mkdir(exist_ok=True)
@@ -263,6 +278,23 @@ COLS = {  # files whose real (post, prompt) columns the name heuristic cannot gu
 }
 
 
+ABOUT = ('Write a LinkedIn post about ', 'Write a post about ')
+
+
+def keywords(posts, k=3):
+    """Each post's k topic words: its hashtags that are plain words (#leadership, not #companyculture),
+    then its most distinctive body words by tf-idf across posts."""
+    words = [re.findall(r"(?<![#@\w'’])[a-z]{4,}(?![\w'’])", p.lower()) for p in posts]  # no tags, no "couldn’t"
+    df = collections.Counter(w for ws in words for w in set(ws))
+    rare = max(2, len(posts) // 10000)  # typos and one-off names are distinctive, but no topic
+    out = []
+    for p, ws in zip(posts, words):
+        tags = [t for t in dict.fromkeys(re.findall(r'#([a-z]+)\b', p.lower())) if df[t] >= rare]
+        tf = collections.Counter(w for w in ws if df[w] >= rare and w not in tags)
+        out.append((tags + sorted(tf, key=lambda w: -tf[w] * math.log(len(posts) / df[w])))[:k])
+    return out
+
+
 def related(prompt, post):
     """True if the prompt shares a content word (5-char prefix match) with the post."""
     stem = lambda t: {w[:5] for w in re.findall(r'[a-z]{4,}', t.lower())}
@@ -310,22 +342,32 @@ def prep(src='data/raw', out='data/posts.jsonl', min_chars=100, max_chars=6000, 
             key, tail = norm[:300], norm[-120:]                   # same opening or same ending = near-duplicate
             if min_chars <= len(post) <= max_chars and english(post) and key not in seen and tail not in seen:
                 p = clean(praw) if pcol else ''
-                # boilerplate, JSON config blobs and "unknown" placeholders teach nothing. Fall back to
-                # the post's hashtags as a topic prompt, else its hook -- a prefix-only prompt would
-                # teach the model to continue text rather than write a post from an instruction.
-                # A prompt sharing no content word with its post is a mismatched pair: same fallback.
-                if not p or p.startswith('{') or 'unknown' in p.lower() or dupes[str(praw)] > 3 or not related(p, post):
-                    tags = re.findall(r'#(\w+)', post)[:3]
-                    p = ('Write a LinkedIn post about ' + ', '.join(t.lower() for t in tags)
-                         if tags else post.split('\n')[0][:80])
-                p = p[:120]
-                if per_prompt[p] >= max_per_prompt:               # one account's hashtag prompt must not dominate
+                # boilerplate, JSON config blobs and "unknown" placeholders teach nothing, and a prompt sharing
+                # no content word with its post is a mismatched pair: these get a keyword prompt below instead
+                bad = not p or p.startswith('{') or 'unknown' in p.lower() or dupes[str(praw)] > 3 or not related(p, post)
+                # one account's templated posts (same hashtags, else same first line) must not dominate
+                cap = (', '.join(t.lower() for t in re.findall(r'#(\w+)', post)[:3]) or post.split('\n')[0][:80]
+                       if bad else p[:120])
+                if per_prompt[cap] >= max_per_prompt:
                     continue
-                per_prompt[p] += 1
+                per_prompt[cap] += 1
                 seen.update((key, tail))
-                kept.append({'prompt': p, 'post': post})
+                kept.append({'prompt': None if bad else p[:300], 'post': post})
                 n += 1
         print(f'{f.name}: {n} posts from {col!r}' + (f', prompts from {pcol!r}' if pcol else ''))
+    # Prompts in the shape people type them. A post without a real prompt gets its most distinctive words:
+    # its hashtags used to fill in, and taught the model that what follows "Write a LinkedIn post about" is a
+    # run-together tag list to copy (#finishinginternship); its first line taught it to echo the prompt.
+    # Half the real descriptive prompts get the same "Write a post about" opening, so it leads into real topics.
+    rng = random.Random(0)
+    for r, kw in zip(kept, keywords([r['post'] for r in kept])):
+        p = r['prompt']
+        if p is None:
+            p = rng.choice(ABOUT) + ', '.join(kw) if kw else r['post'].split('\n')[0][:80]
+        elif not re.match(r'(write|generate|create|draft|craft|compose)\b', p, re.I) and rng.random() < 0.5:
+            # "The author discusses X" -> "Write a post about X"
+            p = rng.choice(ABOUT) + re.sub(r'^The (author|user|writer|poster) \w{4,}s (on |about |that )?', '', p).rstrip('.')
+        r['prompt'] = p
     pathlib.Path(out).parent.mkdir(parents=True, exist_ok=True)
     with open(out, 'w') as fh:
         for r in kept:
@@ -486,8 +528,9 @@ def test():
         rows = load_rows(f'{d}/posts.jsonl')
     assert len(rows) == 2, rows                      # dupe, short and Russian dropped
     assert 'http' not in rows[0]['post'] and 'see more' not in rows[0]['post'], rows[0]
-    assert rows[0]['prompt'] == 'Topic: cloud certification', rows[0]
-    assert rows[1]['prompt'] == 'Write a LinkedIn post about cloud, data', rows[1]  # JSON blob -> hashtag topic
+    assert rows[0]['prompt'].endswith('opic: cloud certification'), rows[0]  # real prompt, maybe "Write a post about"
+    p = rows[1]['prompt']  # JSON blob -> the post's own words, never its hashtags ('cloud' is only a tag there)
+    assert p.startswith(ABOUT) and 'cloud' not in p and all(w in rows[1]['post'].lower() for w in p.split('about ')[1].split(', ')), p
 
     with tempfile.TemporaryDirectory() as d:
         # a tokenizer trained here, on these posts: round-trips text and keeps the special ids
@@ -528,6 +571,11 @@ def test():
 
     # eval: a looping post scores high on repeats, a sane one zero
     assert repeats('a b c a b c a b c') > 0.5 and repeats('one two three four') == 0
+    tags = collections.Counter({'internship': 50})
+    r = judge('Write a post about finishing my internship', 'internship', 'Write a post about finishing my internship. #finishinginternship', tags)
+    assert r['topic'] and r['echo'] and r['coined'], r
+    r = judge('Write a post about finishing my internship', 'internship', 'Done with my internship! #Internship', tags)
+    assert r['topic'] and not r['echo'] and not r['coined'], r
     _tok = None
     print('ok')
 
@@ -535,7 +583,7 @@ def test():
 if __name__ == '__main__':
     cmd = sys.argv[1] if len(sys.argv) > 1 else ''
     if cmd == 'train':
-        train(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 5000)
+        train(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 5000, out=sys.argv[4] if len(sys.argv) > 4 else 'ckpt')
     elif cmd == 'pretrain':
         pretrain(int(sys.argv[2]) if len(sys.argv) > 2 else 30000)
     elif cmd == 'generate':

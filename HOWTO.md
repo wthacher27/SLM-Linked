@@ -47,9 +47,10 @@ Folds every file under `data/raw/` into `data/posts.jsonl`: picks each file's
 real post-text column (see `COLS` in `slm.py` for the couple of files where
 that can't be guessed by name), normalizes Unicode, strips links, drops
 short/long/non-English/duplicate posts, and builds a prompt for each post
-(real prompt column → hashtags as a topic → the post's own first line).
+(real prompt column, half of them as "Write a post about ..." → the post's
+own topic words, never its run-together hashtags).
 
-Check: prints `wrote 198734 posts, 75.7 MB to data/posts.jsonl` (or close to
+Check: prints `wrote 196296 posts, 74.4 MB to data/posts.jsonl` (or close to
 it — a source dataset changing upstream will shift this a little).
 
 ## 5. Pretrain on general English
@@ -80,6 +81,9 @@ start over from random init.
 ```bash
 .venv/bin/python slm.py train data/posts.jsonl 20000
 ```
+
+(A third argument picks the output dir, e.g. `train data/posts.jsonl 20000
+ckpt-v2`, to keep the current `ckpt/` around to compare against with `eval`.)
 
 Starts from `pre/` and its tokenizer (without `pre/`, it trains a fresh
 tokenizer on the posts and starts from random init instead). Cosine LR

@@ -55,10 +55,15 @@ automatically (preferring a post-shaped name, falling back to the longest
 average string; skips JSON/URL columns), NFKC-normalizes fancy Unicode,
 strips links and "…see more", drops posts under 100 or over 6000 characters,
 drops non-English and near-duplicate posts. For the prompt it uses a real
-prompt/instruction column when the file has one, else the post's hashtags as
-a topic ("Write a LinkedIn post about ai, hiring"), else the post's own hook.
-A few files whose real columns can't be guessed by name are listed explicitly
-in `COLS`.
+prompt/instruction column when the file has one, else the post's topic words
+("Write a post about leadership, mentoring, roundtable"): its plain-word
+hashtags, then its most distinctive words by tf-idf. Half the real descriptive
+prompts get the same "Write a (LinkedIn) post about ..." opening, so the
+phrase people actually type leads into real topics. (Hashtag-list prompts
+like "about companyculture, wearehiring" taught the model to copy prompt
+words into run-together tags; first-line prompts taught it to echo the
+prompt.) A few files whose real columns can't be guessed by name are listed
+explicitly in `COLS`.
 
 Training data format, one JSON object per line:
 
@@ -66,8 +71,8 @@ Training data format, one JSON object per line:
 {"prompt": "finishing a bootcamp", "post": "Some personal news 🎉\n\nAfter 6 months..."}
 ```
 
-Current corpus: **~199k posts, 76MB**, roughly half topic-style prompts and
-half real/hook prompts. Kaggle's `mozharovartem/english-linkedin-posts`
+Current corpus: **~196k posts, 74MB**: about a third bare real prompts, a
+third real prompts as "Write a post about ...", a third topic-word prompts. Kaggle's `mozharovartem/english-linkedin-posts`
 (plain-English ↔ LinkedIn-speak pairs) is 85% of it, so the corpus currently
 skews toward that dataset's machine-generated corporate voice; the influencer
 and scraped sources are the more authentic human-voice slice.
@@ -88,6 +93,9 @@ is scored on:
 
 - **on topic**: matches that prompt's topic regex (e.g. `laid off|layoff`)
 - **finished**: ended on its own instead of running into the context limit
+- **echoes prompt**: opens by repeating the prompt
+- **coined tags**: has a hashtag built from the prompt's words that the
+  training posts (`data/posts.jsonl`) almost never use, like `#finishinginternship`
 - **repeated trigrams**: share of word trigrams seen earlier in the post (loops)
 - **median words**
 
