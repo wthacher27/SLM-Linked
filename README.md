@@ -97,6 +97,12 @@ run, on-topic gaps under ~10 points are sampling noise.
 
 ## Notes
 
+- `generate` samples 16 posts and returns the one the prompt explains best:
+  highest log p(post | prompt) − log p(post | "Write a LinkedIn post"), so a
+  fluent post that ignores the prompt scores ~0. On eval this took on topic
+  from 57% (one sample) to 90%. Pass `best_of=1` to `generate()` for a single
+  raw sample.
+
 - 76MB of data is enough for the model to produce real English; below ~20MB
   expect LinkedIn-flavored word salad instead of coherent posts.
 - Training pads each batch to a bucketed width (64/128/256/384/512 tokens),

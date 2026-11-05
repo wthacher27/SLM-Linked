@@ -60,8 +60,11 @@ def decode(ids):
     return tokenizer().decode([i for i in ids if i > POST])
 
 
-# byte models repeat; the penalty and top_p matter more than temperature here
-SAMPLE = dict(do_sample=True, temperature=0.9, top_p=0.9, repetition_penalty=1.1)
+# byte models repeat; the penalty and top_p matter more than temperature here. 0.7 beat 0.9 and 1.1 on
+# eval's on-topic score at every BEST_OF tried (4, 8, 16)
+SAMPLE = dict(do_sample=True, temperature=0.7, top_p=0.9, repetition_penalty=1.1)
+BEST_OF = 16  # on topic, temperature 0.9: 1 sample 62%, best of 4 73%, 8 77%, 16 86%
+GENERIC = 'Write a LinkedIn post'  # the no-particular-topic prompt pick() measures against
 
 
 def complete(model, prompt, max_new=BLOCK, n=1, **kw):
@@ -73,8 +76,33 @@ def complete(model, prompt, max_new=BLOCK, n=1, **kw):
     return out[:, ids.shape[1]:].tolist()
 
 
-def generate(model, prompt, max_new=BLOCK, **kw):
-    return decode(complete(model, prompt, max_new, **kw)[0])
+def logp(model, prompt, cands):
+    """Summed log-prob of each candidate (token ids) as the continuation of prompt."""
+    pre = encode(prompt)
+    cands = [c[:BLOCK - len(pre)] for c in cands]
+    x = torch.full((len(cands), len(pre) + max(map(len, cands))), END)
+    keep = torch.zeros(x.shape, dtype=torch.bool)
+    for i, c in enumerate(cands):
+        x[i, :len(pre) + len(c)] = torch.tensor(pre + c)
+        keep[i, len(pre):len(pre) + len(c)] = True
+    x, keep = x.to(model.device), keep.to(model.device)
+    with torch.no_grad():
+        lp = model(input_ids=x).logits[:, :-1].log_softmax(-1).gather(-1, x[:, 1:, None])[..., 0]
+    return (lp * keep[:, 1:]).sum(1)
+
+
+def pick(model, prompt, cands):
+    """The candidate the prompt explains best: log p(post | prompt) - log p(post | GENERIC). A fluent but
+    off-topic post is about as likely under either and scores ~0. Plain log p(post | prompt) is worse than
+    not reranking at all (picks short bland posts), and counting prompt words in the post games eval
+    ("about leadership, leadership, and leadership")."""
+    cands = [c[:c.index(END) + 1] if END in c else c for c in cands]  # drop the padding after END
+    return cands[(logp(model, prompt, cands) - logp(model, GENERIC, cands)).argmax()]
+
+
+def generate(model, prompt, max_new=BLOCK, best_of=BEST_OF, **kw):
+    """The best (see pick) of best_of sampled posts."""
+    return decode(pick(model, prompt, complete(model, prompt, max_new, n=best_of, **kw)))
 
 
 EVAL = [  # (prompt, regex an on-topic post matches): phrased the way people ask, not the way prep's prompts read
@@ -113,9 +141,10 @@ def repeats(text):
     return 1 - len(set(tri)) / len(tri) if tri else 0.0
 
 
-def evaluate(ckpt='ckpt', name=None, n=4):
-    """n samples per EVAL prompt with fixed seeds, scored on staying on topic, finishing on their own and not
-    looping. Val loss can't see any of that. Samples -> evals/<name>.md, one score row -> evals/scores.md."""
+def evaluate(ckpt='ckpt', name=None, n=4, best_of=BEST_OF):
+    """n posts per EVAL prompt, each picked from best_of samples the way generate() does, with fixed seeds;
+    scored on staying on topic, finishing on their own and not looping. Val loss can't see any of that.
+    Posts -> evals/<name>.md, one score row -> evals/scores.md."""
     global _tok
     _tok = None
     tokenizer(f'{ckpt}/tokenizer.json')  # the checkpoint's own: ckpt-scratch/ speaks a different one
@@ -125,7 +154,9 @@ def evaluate(ckpt='ckpt', name=None, n=4):
     for i, (prompt, topic) in enumerate(EVAL):
         torch.manual_seed(i)  # per prompt: re-running one checkpoint reproduces its samples exactly
         body.append(f'## {i + 1}. {prompt}\n')
-        for ids in complete(model, prompt, n=n):
+        cands = complete(model, prompt, n=n * best_of)
+        for j in range(n):
+            ids = pick(model, prompt, cands[j * best_of:(j + 1) * best_of])
             post = decode(ids)
             r = dict(topic=bool(re.search(rf'\b({topic})', post, re.I)), done=ids[-1] == END,
                      rep=repeats(post), words=len(post.split()))
@@ -140,8 +171,8 @@ def evaluate(ckpt='ckpt', name=None, n=4):
     d = pathlib.Path('evals')
     d.mkdir(exist_ok=True)
     (d / f'{name}.md').write_text(
-        f'# {name}\n\n`{ckpt}/` on {DEV}: {len(EVAL)} prompts x {n} samples, seeds 0-{len(EVAL) - 1}, '
-        f'sampling `{SAMPLE}`\n\n' + row(score) + row(['---'] * len(score)) + row(score.values()) + '\n'
+        f'# {name}\n\n`{ckpt}/` on {DEV}: {len(EVAL)} prompts x {n} posts, each the best of {best_of}, '
+        f'seeds 0-{len(EVAL) - 1}, sampling `{SAMPLE}`\n\n' + row(score) + row(['---'] * len(score)) + row(score.values()) + '\n'
         + '\n'.join(body), encoding='utf-8')
     log = d / 'scores.md'
     if not log.exists():  # with ~100 samples a run, gaps under ~10 points are sampling noise
@@ -487,9 +518,13 @@ def test():
         for _ in range(300):
             loss = model(input_ids=x, labels=x).loss
             opt.zero_grad(); loss.backward(); opt.step()
-        out = generate(model, 'promo', max_new=60, do_sample=False)
+        out = generate(model, 'promo', max_new=60, best_of=1, do_sample=False)
         assert out == 'I am thrilled to announce...', repr(out)
         assert complete(model, 'promo', max_new=60, do_sample=False)[0][-1] == END  # stopped on its own
+        # pick: the post this prompt explains wins over one any prompt would produce
+        good = encode('promo', 'I am thrilled to announce...')[len(encode('promo')):]
+        junk = tokenizer().encode('hi').ids + [END]
+        assert pick(model, 'promo', [junk, good + [END, END]]) == good, 'pick must prefer the trained post'
 
     # eval: a looping post scores high on repeats, a sane one zero
     assert repeats('a b c a b c a b c') > 0.5 and repeats('one two three four') == 0
