@@ -42,6 +42,9 @@ tokenizer fit to the posts alone.
 
 Best-validation checkpoints land in `pre/` and `ckpt/`, each with its matching
 `tokenizer.json` copied alongside it (a checkpoint and its tokenizer are useless apart).
+`ckpt/` also gets `tags.txt`: the hashtags its training posts use 3+ times,
+which the coined-tag check needs (see Validating). For a checkpoint trained
+before this existed: `python -c "import slm; slm.save_tags(slm.load_rows('data/posts.jsonl'), 'ckpt')"`.
 
 `data/`, `pre/`, `ckpt/` and `.venv/` are gitignored — rebuild them with the commands
 above rather than committing them; `data/posts.jsonl` alone is ~90MB.
@@ -120,8 +123,11 @@ run, on-topic gaps under ~6 points are sampling noise. (Runs before
 `generate` checks each of its samples against `requirements()` with
 [Mellea](https://pypi.org/project/mellea/) before reranking: it finished on its
 own, doesn't paste the prompt in (at the start or mid-sentence, "announce that
-Just got promoted..."), doesn't loop, and is at least 100 characters. These are
-plain Python checks; no judge model is involved. The PMI rerank then chooses
+Just got promoted..."), doesn't loop, is at least 100 characters, and coins no
+hashtags from the prompt's words (any tag outside the checkpoint's `tags.txt`
+that's built from them, like `#finishinginternship`). These are plain Python
+checks; no judge model is involved. The tag check took **coined tags** from 8%
+to 0% with on-topic unchanged (`evals/coined-req.md` vs `baseline-n12.md`). The PMI rerank then chooses
 among the samples that pass (or among all of them, if none do). Filtering first
 matters, because pasting the prompt in raises the PMI score. It took **echoes
 prompt** from 5% to 0% without moving on-topic (`evals/mellea.md` vs

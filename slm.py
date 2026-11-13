@@ -25,6 +25,7 @@ DEV = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_av
 # Still from scratch: this is training data, not pretrained weights.
 PRETRAIN = ('HuggingFaceFW/fineweb-edu', 'sample-10BT')
 _tok = None
+_tags = None  # the hashtags the loaded checkpoint's training posts use: see load() and coined()
 
 
 def tokenizer(path=None):
@@ -38,11 +39,31 @@ def tokenizer(path=None):
 
 
 def load(ckpt='ckpt'):
-    """The model in ckpt/, switched to the tokenizer saved with it: a checkpoint and its tokenizer must match."""
-    global _tok
+    """The model in ckpt/, switched to the tokenizer saved with it: a checkpoint and its tokenizer must match.
+    Its tags.txt (see save_tags), if it has one, becomes _tags."""
+    global _tok, _tags
     _tok = None
     tokenizer(f'{ckpt}/tokenizer.json')
+    tags = pathlib.Path(ckpt, 'tags.txt')
+    _tags = set(tags.read_text(encoding='utf-8').split()) if tags.exists() else None
     return LlamaForCausalLM.from_pretrained(ckpt).to(DEV).eval()
+
+
+def known_tags(rows):
+    """Hashtags used 3+ times in rows' posts, lowercased: the ones people actually use."""
+    n = collections.Counter(t.lower() for r in rows for t in re.findall(r'#(\w+)', r['post']))
+    return {t for t, k in n.items() if k >= 3}
+
+
+def save_tags(rows, out):
+    """known_tags(rows) -> out/tags.txt: a checkpoint carries the tags it learned from, as it does its tokenizer."""
+    pathlib.Path(out, 'tags.txt').write_text('\n'.join(sorted(known_tags(rows))), encoding='utf-8')
+
+
+def coined(prompt, post, tags):
+    """Has a hashtag built from the prompt's words (#finishinginternship) that isn't in tags, the ones people use."""
+    words = set(re.findall(r'[a-z]{5,}', prompt.lower())) - {'write', 'linkedin', 'about'}
+    return any(t.lower() not in tags and any(w in t.lower() for w in words) for t in re.findall(r'#(\w+)', post))
 
 
 def train_tokenizer(rows, path=TOK_PATH, vocab=VOCAB):
@@ -113,7 +134,9 @@ def requirements(prompt, done):
             # opening with the prompt is eval's echo; the paste also lands mid-sentence ("announce that Just got ...")
             must('Does not paste the prompt in', lambda p: not head or not (p.lower().startswith(head.lower()) or head in p)),
             must('Does not loop', lambda p: repeats(p) < LOOP),
-            must('At least 100 characters, the shortest post prep keeps', lambda p: len(p) >= 100)]
+            must('At least 100 characters, the shortest post prep keeps', lambda p: len(p) >= 100)] + (
+        [must("Its hashtags are ones people use, not coined from the prompt's words", lambda p: not coined(prompt, p, _tags))]
+        if _tags is not None else [])  # a checkpoint from before tags.txt can't tell
 
 
 def validate(prompt, ids):
@@ -185,12 +208,10 @@ STOCK = ('thrilled to', 'excited to', 'incredibly proud', 'testament to', 'drivi
 
 
 def judge(prompt, topic, post, tags):
-    """eval's checks on one post; tags counts each hashtag's uses in the training posts."""
-    words = set(re.findall(r'[a-z]{5,}', prompt.lower())) - {'write', 'linkedin', 'about'}
+    """eval's checks on one post; tags: the hashtags people use (see known_tags)."""
     return dict(topic=bool(re.search(rf'\b({topic})', post, re.I)),
                 echo=post.lower().startswith(prompt.lower()[:25]),  # opens by repeating the prompt
-                # a tag coined from the prompt's words (#finishinginternship), not one people actually use
-                coined=any(tags[t.lower()] < 3 and any(w in t.lower() for w in words) for t in re.findall(r'#(\w+)', post)),
+                coined=coined(prompt, post, tags),
                 stock=any(s in post.lower() for s in STOCK),
                 rep=repeats(post), bi=bigrams(post), words=len(post.split()))
 
@@ -211,7 +232,7 @@ def evaluate(ckpt='ckpt', name=None, n=12, best_of=BEST_OF):
     can't see any of that. Posts -> evals/<name>.md, one score row -> evals/scores.md."""
     model = load(ckpt)  # with its own tokenizer: ckpt-scratch/ speaks a different one
     name =name or f'{pathlib.Path(ckpt).name}-{datetime.date.today()}'
-    tags = collections.Counter(t.lower() for r in load_rows('data/posts.jsonl') for t in re.findall(r'#(\w+)', r['post']))
+    tags = _tags if _tags is not None else known_tags(load_rows('data/posts.jsonl'))  # a checkpoint without tags.txt
     rows, body = [], []
     for i, (prompt, topic) in enumerate(EVAL):
         torch.manual_seed(i)  # per prompt: re-running one checkpoint reproduces its samples exactly
@@ -472,6 +493,7 @@ def train(path, iters=5000, cfg=CFG, batch=16, lr=3e-4, out='ckpt', init='pre'):
     tokenizer(tok)  # explicitly: tokenizer() would otherwise pick up an older ckpt/'s
     pathlib.Path(out).mkdir(parents=True, exist_ok=True)
     shutil.copy(tok, f'{out}/tokenizer.json')  # keep them together, they must match
+    save_tags(rows, out)
     exs = [(ids, len(encode(r.get('prompt', ''))))
            for r in rows for ids in [encode(r.get('prompt', ''), r['post'])[:BLOCK]]]
     exs = [e for e in exs if e[1] < len(e[0])]  # keep only examples with post bytes left after truncation
@@ -591,7 +613,7 @@ def test():
     with tempfile.TemporaryDirectory() as d:
         # a tokenizer trained here, on these posts: round-trips text and keeps the special ids
         vocab = train_tokenizer(rows * 20, f'{d}/tok.json', vocab=400)
-        global _tok
+        global _tok, _tags
         _tok = None
         tokenizer(f'{d}/tok.json')
         txt = 'I am thrilled to announce my cloud certification!'
@@ -630,20 +652,25 @@ def test():
         assert all(validate('Write a post about my internship', say(ok)))
         assert not all(validate('Write a post about my internship', say(ok, ())))
         assert not all(validate('Just got promoted to Senior Engineer', say('Excited to say that Just got promoted to Senior Engineer! ' + ok)))
-        # load: a saved checkpoint comes back with its own tokenizer and writes the same post
+        # load: a saved checkpoint comes back with its own tokenizer and tags, and writes the same post
         model.save_pretrained(f'{d}/ck')
         shutil.copy(f'{d}/tok.json', f'{d}/ck/tokenizer.json')
+        save_tags([{'post': '#Internship #internship'}, {'post': '#internship #rare'}], f'{d}/ck')
         assert generate(load(f'{d}/ck'), 'promo', max_new=60, best_of=1, do_sample=False) == out
+        assert _tags == {'internship'}, _tags
+        # with tags loaded, a tag coined from the prompt's words fails validation; a real one passes
+        p = 'Write a post about finishing my internship'
+        assert all(validate(p, say(ok + ' #Internship'))) and not all(validate(p, say(ok + ' #FinishingInternship')))
 
     # eval: a looping post scores high on repeats, a sane one zero
     assert repeats('a b c a b c a b c') > 0.5 and repeats('one two three four') == 0
-    tags = collections.Counter({'internship': 50})
+    tags = {'internship'}
     r = judge('Write a post about finishing my internship', 'internship', 'Write a post about finishing my internship. #finishinginternship', tags)
     assert r['topic'] and r['echo'] and r['coined'], r
     r = judge('Write a post about finishing my internship', 'internship', 'Done with my internship! #Internship', tags)
     assert r['topic'] and not r['echo'] and not r['coined'] and not r['stock'], r
     assert judge('Write a post about finishing my internship', 'internship', 'Thrilled to wrap up my internship', tags)['stock']
-    _tok = None
+    _tok = _tags = None
     print('ok')
 
 

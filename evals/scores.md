@@ -11,3 +11,4 @@
 | run | on topic | finished | echoes prompt | coined tags | stock phrasing | distinct-2 | repeated trigrams | median words |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | [baseline-n12](baseline-n12.md) | 90% | 100% | 0% | 8% | 34% | 0.42 | 0.4% | 49 |
+| [coined-req](coined-req.md) | 91% | 100% | 0% | 0% | 33% | 0.42 | 0.4% | 50 |
