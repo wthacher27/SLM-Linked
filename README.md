@@ -88,22 +88,32 @@ Do not scrape LinkedIn directly — it breaks their ToS.
 ## Evaluating
 
 Val loss says how well the model predicts posts, not whether it writes about
-what you asked. `slm.py eval [ckpt] [name]` samples 4 posts for each of 25
+what you asked. `slm.py eval [ckpt] [name]` samples 12 posts for each of 25
 fixed prompts in `EVAL` (phrased the way people actually ask), with fixed
-seeds, so re-running one checkpoint reproduces its samples exactly. Each post
-is scored on:
+seeds, so re-running one checkpoint reproduces its samples exactly (~6 min on a
+GTX 1660 Ti). Each post is scored on:
 
 - **on topic**: matches that prompt's topic regex (e.g. `laid off|layoff`)
 - **finished**: ended on its own instead of running into the context limit
 - **echoes prompt**: opens by repeating the prompt
 - **coined tags**: has a hashtag built from the prompt's words that the
   training posts (`data/posts.jsonl`) almost never use, like `#finishinginternship`
+- **stock phrasing**: uses one of the phrases in `STOCK` ("thrilled to",
+  "testament to", "driving innovation", ...)
+- **distinct-2**: unique word pairs / all word pairs, across the whole run.
+  It's low when every post says the same things
 - **repeated trigrams**: share of word trigrams seen earlier in the post (loops)
 - **median words**
 
+For reference, 300 random training posts (the same count and length as a run)
+score ~9% stock phrasing and ~0.74 distinct-2. The model at temperature 0.7
+scores 34% and 0.42: it flattens the corpus into one corporate voice.
+
 All samples go to `evals/<name>.md`; one score row per run is appended to
-`evals/scores.md`, the table to compare changes against. With 100 samples per
-run, on-topic gaps under ~10 points are sampling noise.
+`evals/scores.md`, the table to compare changes against. When the set of
+metrics changes, a new table starts below the old one. With 300 samples per
+run, on-topic gaps under ~6 points are sampling noise. (Runs before
+`baseline-n12` had 100 samples, where the threshold was ~10 points.)
 
 ## Validating
 

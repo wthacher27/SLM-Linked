@@ -160,7 +160,7 @@ EVAL = [  # (prompt, regex an on-topic post matches): phrased the way people ask
     ('Write about switching careers from teaching to software engineering', r'teach|career (change|switch|pivot)'),
     ('Write a LinkedIn post about dealing with burnout', r'burn.?out|exhaust|mental health'),
     ('Share tips for public speaking', r'speak|presentation|audience'),
-    ('Announce that we open-sourced our internal tool', r'open.?source|github'),
+    ('Announce that we open-sourced our internal tool', r'open.?sourc|github'),
     ('Write a post about volunteering at a food bank', r'volunteer|food'),
     ('Recommend a book that changed how I think about leadership', r'book|author'),
     ('Write a customer success story about a client who doubled their revenue', r'client|customer|revenue'),
@@ -175,6 +175,15 @@ def repeats(text):
     return 1 - len(set(tri)) / len(tri) if tri else 0.0
 
 
+def bigrams(text):
+    w = re.findall(r'\w+', text.lower())
+    return list(zip(w, w[1:]))
+
+
+# the phrases the model leans on: in 34% of its eval posts (baseline-n12), ~9% of the training posts
+STOCK = ('thrilled to', 'excited to', 'incredibly proud', 'testament to', 'driving innovation')
+
+
 def judge(prompt, topic, post, tags):
     """eval's checks on one post; tags counts each hashtag's uses in the training posts."""
     words = set(re.findall(r'[a-z]{5,}', prompt.lower())) - {'write', 'linkedin', 'about'}
@@ -182,20 +191,24 @@ def judge(prompt, topic, post, tags):
                 echo=post.lower().startswith(prompt.lower()[:25]),  # opens by repeating the prompt
                 # a tag coined from the prompt's words (#finishinginternship), not one people actually use
                 coined=any(tags[t.lower()] < 3 and any(w in t.lower() for w in words) for t in re.findall(r'#(\w+)', post)),
-                rep=repeats(post), words=len(post.split()))
+                stock=any(s in post.lower() for s in STOCK),
+                rep=repeats(post), bi=bigrams(post), words=len(post.split()))
 
 
 def summarize(rows):
     share = lambda k: f'{sum(r[k] for r in rows) / len(rows):.0%}'
+    bi = [b for r in rows for b in r['bi']]
     return {'on topic': share('topic'), 'finished': share('done'), 'echoes prompt': share('echo'),
-            'coined tags': share('coined'), 'repeated trigrams': f"{statistics.mean(r['rep'] for r in rows):.1%}",
+            'coined tags': share('coined'), 'stock phrasing': share('stock'),
+            'distinct-2': f'{len(set(bi)) / len(bi):.2f}',  # across the run: low when every post says the same things
+            'repeated trigrams': f"{statistics.mean(r['rep'] for r in rows):.1%}",
             'median words': f"{statistics.median(r['words'] for r in rows):.0f}"}
 
 
-def evaluate(ckpt='ckpt', name=None, n=4, best_of=BEST_OF):
+def evaluate(ckpt='ckpt', name=None, n=12, best_of=BEST_OF):
     """n posts per EVAL prompt, each picked from best_of samples the way generate() does, with fixed seeds;
-    scored on staying on topic, finishing on their own and not looping. Val loss can't see any of that.
-    Posts -> evals/<name>.md, one score row -> evals/scores.md."""
+    scored on staying on topic, finishing on their own, not looping and how stock the phrasing is. Val loss
+    can't see any of that. Posts -> evals/<name>.md, one score row -> evals/scores.md."""
     model = load(ckpt)  # with its own tokenizer: ckpt-scratch/ speaks a different one
     name =name or f'{pathlib.Path(ckpt).name}-{datetime.date.today()}'
     tags = collections.Counter(t.lower() for r in load_rows('data/posts.jsonl') for t in re.findall(r'#(\w+)', r['post']))
@@ -203,9 +216,8 @@ def evaluate(ckpt='ckpt', name=None, n=4, best_of=BEST_OF):
     for i, (prompt, topic) in enumerate(EVAL):
         torch.manual_seed(i)  # per prompt: re-running one checkpoint reproduces its samples exactly
         body.append(f'## {i + 1}. {prompt}\n')
-        cands = complete(model, prompt, n=n * best_of)
-        for j in range(n):
-            ids = pick(model, prompt, cands[j * best_of:(j + 1) * best_of])
+        for j in range(n):  # one best_of batch at a time: n * best_of sequences at once is GBs of KV cache
+            ids = pick(model, prompt, complete(model, prompt, n=best_of))
             post = decode(ids)
             r = judge(prompt, topic, post, tags) | dict(done=ids[-1] == END)
             rows.append(r)
@@ -220,11 +232,11 @@ def evaluate(ckpt='ckpt', name=None, n=4, best_of=BEST_OF):
         f'# {name}\n\n`{ckpt}/` on {DEV}: {len(EVAL)} prompts x {n} posts, each the best of {best_of}, '
         f'seeds 0-{len(EVAL) - 1}, sampling `{SAMPLE}`\n\n' + row(score) + row(['---'] * len(score)) + row(score.values()) + '\n'
         + '\n'.join(body), encoding='utf-8')
-    log = d / 'scores.md'
-    if not log.exists():  # with ~100 samples a run, gaps under ~10 points are sampling noise
-        log.write_text(row(['run', *score]) + row(['---'] * (len(score) + 1)), encoding='utf-8')
-    with open(log, 'a', encoding='utf-8') as fh:
-        fh.write(row([f'[{name}]({name}.md)', *score.values()]))
+    log = d / 'scores.md'  # with 300 posts a run, gaps under ~6 points are sampling noise (~10 at the old 100)
+    old = log.read_text(encoding='utf-8') if log.exists() else ''
+    head = row(['run', *score]) + row(['---'] * (len(score) + 1))
+    with open(log, 'a', encoding='utf-8') as fh:  # a changed set of metrics starts a new table below the old one
+        fh.write(('' if head in old else '\n' * bool(old) + head) + row([f'[{name}]({name}.md)', *score.values()]))
     print(f'{name}: ' + ', '.join(f'{k} {v}' for k, v in score.items()) + f' -> {d / name}.md')
     return score
 
@@ -629,7 +641,8 @@ def test():
     r = judge('Write a post about finishing my internship', 'internship', 'Write a post about finishing my internship. #finishinginternship', tags)
     assert r['topic'] and r['echo'] and r['coined'], r
     r = judge('Write a post about finishing my internship', 'internship', 'Done with my internship! #Internship', tags)
-    assert r['topic'] and not r['echo'] and not r['coined'], r
+    assert r['topic'] and not r['echo'] and not r['coined'] and not r['stock'], r
+    assert judge('Write a post about finishing my internship', 'internship', 'Thrilled to wrap up my internship', tags)['stock']
     _tok = None
     print('ok')
 
