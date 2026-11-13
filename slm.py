@@ -2,8 +2,8 @@
 
   python slm.py fetch                            # download the curated HF sources -> data/raw/
   python slm.py prep                             # data/raw/* -> data/posts.jsonl
-  python slm.py pretrain [iters]                 # general English first (streams ~1GB of FineWeb-Edu) -> pre/
-  python slm.py train data/posts.jsonl [iters] [out]  # lines of {"prompt": "...", "post": "..."}; pre/ -> out/ (ckpt/)
+  python slm.py pretrain [iters] [out] [mb] [size]  # general English first (streams mb MB of FineWeb-Edu) -> out/ (pre/)
+  python slm.py train data/posts.jsonl [iters] [out] [init]  # lines of {"prompt": "...", "post": "..."}; init/ (pre/) -> out/ (ckpt/)
   python slm.py generate "Just got promoted to Senior Engineer"
   python slm.py eval [ckpt] [name]               # fixed prompts -> evals/<name>.md, scores -> evals/scores.md
   python slm.py deploy user/space [ckpt]         # app.py + the model -> a private Hugging Face Space
@@ -20,6 +20,9 @@ CFG = dict(vocab_size=VOCAB, hidden_size=384, intermediate_size=1024, num_hidden
            num_attention_heads=6, max_position_embeddings=BLOCK, tie_word_embeddings=True,
            bos_token_id=PROMPT, eos_token_id=END, pad_token_id=END,
            attention_dropout=0.1)  # ~13M params; dropout won the size sweep
+# merged over CFG. That sweep trained on ~20M tokens of posts alone; pretraining on ~600M tokens of English
+# (20 per param) can feed a bigger model, which the coherence errors at 13m ("accepted a bootcamp") need
+SIZES = {'13m': {}, '30m': dict(hidden_size=512, intermediate_size=1376, num_hidden_layers=8, num_attention_heads=8)}
 DEV = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
 # ~20M tokens of posts is too little to learn English from, so pretrain on general text first.
 # Still from scratch: this is training data, not pretrained weights.
@@ -555,13 +558,15 @@ def fetch_pretrain(dst='data/pretrain.jsonl', mb=1000):
     print(f'{n / 1e6:.0f} MB of {PRETRAIN[0]} -> {dst}')
 
 
-def pretrain(iters=30000, src='data/pretrain.jsonl', posts='data/posts.jsonl', out='pre', batch=16, lr=6e-4):
-    """Random init -> next-token prediction on general English, saved to out/; train() starts from it.
-    Run prep first: the tokenizer is fit here, to posts and plain English alike, and both stages share it.
-    If out/ already has a model (a cut-off run), continue from its weights; delete out/ to start over."""
+def pretrain(iters=30000, src=None, posts='data/posts.jsonl', out='pre', batch=16, lr=6e-4, mb=1000, size='13m'):
+    """Random init (a model of SIZES[size]) -> next-token prediction on mb MB of general English, saved to out/;
+    train() starts from it. Run prep first: the tokenizer is fit here, to posts and plain English alike, and
+    both stages share it. If out/ already has a model (a cut-off run), continue from its weights and size;
+    delete out/ to start over."""
     import numpy as np
+    src = src or ('data/pretrain.jsonl' if mb == 1000 else f'data/pretrain-{mb}.jsonl')
     if not pathlib.Path(src).exists():
-        fetch_pretrain(src)
+        fetch_pretrain(src, mb)
     docs = [json.loads(l)['text'] for l in open(src)]
     resume = pathlib.Path(out, 'config.json').exists()  # weights only: optimizer and LR schedule start fresh
     if not resume:
@@ -581,7 +586,7 @@ def pretrain(iters=30000, src='data/pretrain.jsonl', posts='data/posts.jsonl', o
         return x, x  # every token is a target
 
     model = (LlamaForCausalLM.from_pretrained(out) if resume
-             else LlamaForCausalLM(LlamaConfig(**CFG | dict(vocab_size=vocab)))).to(DEV)
+             else LlamaForCausalLM(LlamaConfig(**CFG | SIZES[size] | dict(vocab_size=vocab)))).to(DEV)
     print(f'{len(ids):,} tokens, {model.num_parameters() / 1e6:.1f}M params on {DEV}, '
           + (f'resuming {out}/' if resume else 'random init'))
     pathlib.Path(out).mkdir(parents=True, exist_ok=True)
@@ -670,6 +675,8 @@ def test():
     r = judge('Write a post about finishing my internship', 'internship', 'Done with my internship! #Internship', tags)
     assert r['topic'] and not r['echo'] and not r['coined'] and not r['stock'], r
     assert judge('Write a post about finishing my internship', 'internship', 'Thrilled to wrap up my internship', tags)['stock']
+    n = LlamaForCausalLM(LlamaConfig(**CFG | SIZES['30m'])).num_parameters()  # the size its name promises
+    assert 28e6 < n < 31e6, n
     _tok = _tags = None
     print('ok')
 
@@ -677,9 +684,11 @@ def test():
 if __name__ == '__main__':
     cmd = sys.argv[1] if len(sys.argv) > 1 else ''
     if cmd == 'train':
-        train(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 5000, out=sys.argv[4] if len(sys.argv) > 4 else 'ckpt')
+        train(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 5000, out=sys.argv[4] if len(sys.argv) > 4 else 'ckpt',
+              init=sys.argv[5] if len(sys.argv) > 5 else 'pre')
     elif cmd == 'pretrain':
-        pretrain(int(sys.argv[2]) if len(sys.argv) > 2 else 30000)
+        pretrain(int(sys.argv[2]) if len(sys.argv) > 2 else 30000, out=sys.argv[3] if len(sys.argv) > 3 else 'pre',
+                 mb=int(sys.argv[4]) if len(sys.argv) > 4 else 1000, size=sys.argv[5] if len(sys.argv) > 5 else '13m')
     elif cmd == 'generate':
         print(generate(load(), ' '.join(sys.argv[2:])))
     elif cmd == 'fetch':
