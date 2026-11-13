@@ -9,7 +9,7 @@
   python slm.py deploy user/space [ckpt]         # app.py + the model -> a private Hugging Face Space
   python slm.py test                             # self-check
 """
-import collections, datetime, json, math, pathlib, random, re, shutil, statistics, subprocess, sys, unicodedata
+import collections, datetime, itertools, json, math, pathlib, random, re, shutil, statistics, subprocess, sys, unicodedata
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM, get_cosine_schedule_with_warmup
 
@@ -560,6 +560,15 @@ def fetch_pretrain(dst='data/pretrain.jsonl', mb=1000):
     print(f'{n / 1e6:.0f} MB of {PRETRAIN[0]} -> {dst}')
 
 
+def stream_ids(src, t, n=1000):
+    """The docs in src as one long token stream, END after each; uint16 halves the RAM and the vocab fits.
+    n docs at a time: all 2.5GB of text and its Encodings at once ran a 16GB machine out of memory."""
+    import numpy as np
+    with open(src) as fh:
+        return np.concatenate([np.array([i for e in t.encode_batch([json.loads(l)['text'] for l in docs]) for i in e.ids + [END]],
+                                        dtype=np.uint16) for docs in iter(lambda: list(itertools.islice(fh, n)), [])])
+
+
 def pretrain(iters=30000, src=None, posts='data/posts.jsonl', out='pre', batch=16, lr=6e-4, mb=1000, size='13m'):
     """Random init (a model of SIZES[size]) -> next-token prediction on mb MB of general English, saved to out/;
     train() starts from it. Run prep first: the tokenizer is fit here, to posts and plain English alike, and
@@ -569,16 +578,14 @@ def pretrain(iters=30000, src=None, posts='data/posts.jsonl', out='pre', batch=1
     src = src or ('data/pretrain.jsonl' if mb == 1000 else f'data/pretrain-{mb}.jsonl')
     if not pathlib.Path(src).exists():
         fetch_pretrain(src, mb)
-    docs = [json.loads(l)['text'] for l in open(src)]
     resume = pathlib.Path(out, 'config.json').exists()  # weights only: optimizer and LR schedule start fresh
     if not resume:
-        vocab = train_tokenizer(load_rows(posts) + [{'post': d} for d in docs[:len(docs) // 10]])
+        with open(src) as fh:
+            n = sum(1 for _ in fh)
+        with open(src) as fh:  # the first tenth of the docs, alongside the posts
+            vocab = train_tokenizer(load_rows(posts) + [{'post': json.loads(l)['text']} for l in itertools.islice(fh, n // 10)])
     # explicitly: tokenizer() would otherwise pick up an older ckpt/'s; resumed weights only speak out/'s
-    t = tokenizer(f'{out}/tokenizer.json' if resume else TOK_PATH)
-    # one long token stream, END between docs; uint16 halves the RAM and the vocab fits
-    ids = np.concatenate([np.array(e.ids + [END], dtype=np.uint16)
-                          for i in range(0, len(docs), 10000) for e in t.encode_batch(docs[i:i + 10000])])
-    del docs
+    ids = stream_ids(src, tokenizer(f'{out}/tokenizer.json' if resume else TOK_PATH))
     n = int(len(ids) * 0.99)
     tr, va = ids[:n], ids[n:]
 
@@ -628,6 +635,11 @@ def test():
         assert ids[0] == PROMPT and ids[-1] == END and POST in ids, ids
         assert decode(ids[ids.index(POST) + 1:]) == txt, decode(ids[ids.index(POST) + 1:])
         assert len(ids) < len(txt.encode()), 'BPE must beat raw bytes'
+        # stream_ids: chunked encoding (here 4 docs, then 2) gives the same stream as encoding it all at once
+        docs = ['one doc', 'and another'] * 3
+        with open(f'{d}/docs.jsonl', 'w') as fh:
+            fh.writelines(json.dumps({'text': s}) + '\n' for s in docs)
+        assert stream_ids(f'{d}/docs.jsonl', tokenizer(), n=4).tolist() == [i for s in docs for i in tokenizer().encode(s).ids + [END]]
 
         # batches: loss is scored on post tokens only, never on the prompt or the padding
         ids, plen = encode('promo', 'hello'), len(encode('promo'))
