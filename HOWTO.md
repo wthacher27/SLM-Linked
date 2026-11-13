@@ -76,6 +76,19 @@ tokenizer (iter 0 then prints the val loss it stopped at, not ~8.99). Only the
 weights carry over; the optimizer and LR schedule start fresh. Delete `pre/` to
 start over from random init.
 
+**Bigger model:** `pretrain [iters] [out] [mb] [size]` picks the output dir, how
+many MB of FineWeb-Edu to stream (into its own `data/pretrain-<mb>.jsonl`), and
+a preset from `SIZES` in `slm.py`:
+
+```bash
+.venv/bin/python slm.py pretrain 73000 pre-30m 2500 30m
+```
+
+That's 29.4M params on ~2.5GB (~650M tokens, about 20 per param). It runs at
+0.63 s/step and peaks at 3.75 GiB of GPU memory on a GTX 1660 Ti (13m: 0.31 s,
+2.4 GiB), so ~14 hours. Fine-tune it with `train`'s 5th argument, the dir to
+start from (next step).
+
 ## 6. Fine-tune on the posts
 
 ```bash
@@ -83,7 +96,9 @@ start over from random init.
 ```
 
 (A third argument picks the output dir, e.g. `train data/posts.jsonl 20000
-ckpt-v2`, to keep the current `ckpt/` around to compare against with `eval`.)
+ckpt-v2`, to keep the current `ckpt/` around to compare against with `eval`.
+A fourth picks the pretrained dir to start from, e.g. `train data/posts.jsonl
+20000 ckpt-30m pre-30m`: ~6.5 hours for the 30m size.)
 
 Starts from `pre/` and its tokenizer (without `pre/`, it trains a fresh
 tokenizer on the posts and starts from random init instead). Cosine LR

@@ -26,6 +26,8 @@ HuggingFace/GitHub sources.
 .venv/bin/python slm.py prep                             # data/raw/* -> data/posts.jsonl
 .venv/bin/python slm.py pretrain 30000                   # general English -> pre/ (fits the tokenizer)
 .venv/bin/python slm.py train data/posts.jsonl 20000     # fine-tunes pre/ on the posts -> ckpt/
+.venv/bin/python slm.py pretrain 73000 pre-30m 2500 30m  # or a 29M model on 2.5GB -> pre-30m/ (~14h)
+.venv/bin/python slm.py train data/posts.jsonl 20000 ckpt-30m pre-30m  # ... fine-tuned -> ckpt-30m/ (~6.5h)
 .venv/bin/python slm.py generate "Write a short post about finishing a bootcamp"
 .venv/bin/python slm.py eval ckpt my-change              # 100 samples, scored -> evals/my-change.md
 .venv/bin/python app.py                                  # web page + HTTP API on localhost:7860
