@@ -93,9 +93,11 @@ def decode(ids):
     return tokenizer().decode([i for i in ids if i > POST])
 
 
-# byte models repeat; the penalty and top_p matter more than temperature here. 0.7 beat 0.9 and 1.1 on
-# eval's on-topic score at every BEST_OF tried (4, 8, 16)
-SAMPLE = dict(do_sample=True, temperature=0.7, top_p=0.9, repetition_penalty=1.1)
+# byte models repeat; the penalty and top_p matter more than temperature here. On on-topic alone 0.7 won
+# (beat 0.9 and 1.1 at every BEST_OF tried), but it flattens the voice: against it, 0.9 trades ~4 points of
+# on topic (91% -> 87%, inside the noise) for distinct-2 0.42 -> 0.52 and stock phrasing 33% -> 30%.
+# 1.0 gets to 0.55 / 28% at 85% on topic (evals/temp-*.md). Re-sweep for each model size.
+SAMPLE = dict(do_sample=True, temperature=0.9, top_p=0.9, repetition_penalty=1.1)
 BEST_OF = 16  # on topic, temperature 0.9: 1 sample 62%, best of 4 73%, 8 77%, 16 86%
 GENERIC = 'Write a LinkedIn post'  # the no-particular-topic prompt pick() measures against
 

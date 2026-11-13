@@ -110,7 +110,10 @@ GTX 1660 Ti). Each post is scored on:
 
 For reference, 300 random training posts (the same count and length as a run)
 score ~9% stock phrasing and ~0.74 distinct-2. The model at temperature 0.7
-scores 34% and 0.42: it flattens the corpus into one corporate voice.
+scores 34% and 0.42: it flattens the corpus into one corporate voice. Sampling
+now runs at 0.9 (0.52 distinct-2, 30% stock phrasing, ~4 points less on topic;
+see `evals/temp-*.md`). Temperature barely moves the stock phrasing, though:
+that gap is the model's, not the sampler's.
 
 All samples go to `evals/<name>.md`; one score row per run is appended to
 `evals/scores.md`, the table to compare changes against. When the set of
