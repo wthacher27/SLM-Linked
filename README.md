@@ -105,6 +105,19 @@ All samples go to `evals/<name>.md`; one score row per run is appended to
 `evals/scores.md`, the table to compare changes against. With 100 samples per
 run, on-topic gaps under ~10 points are sampling noise.
 
+## Validating
+
+`generate` checks each of its samples against `requirements()` with
+[Mellea](https://pypi.org/project/mellea/) before reranking: it finished on its
+own, doesn't paste the prompt in (at the start or mid-sentence, "announce that
+Just got promoted..."), doesn't loop, and is at least 100 characters. These are
+plain Python checks; no judge model is involved. The PMI rerank then chooses
+among the samples that pass (or among all of them, if none do). Filtering first
+matters, because pasting the prompt in raises the PMI score. It took **echoes
+prompt** from 5% to 0% without moving on-topic (`evals/mellea.md` vs
+`prompts-v2.md`). Exact pastes are all it catches: near-pastes like "Share a
+Leadership lesson" still get through.
+
 ## Querying remotely
 
 `app.py` wraps `generate` in a Gradio page with an HTTP API (one endpoint,

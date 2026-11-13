@@ -100,12 +100,37 @@ def logp(model, prompt, cands):
     return (lp * keep[:, 1:]).sum(1)
 
 
+LOOP = 0.2  # repeats() share that counts as a loop: the worst of 1600 sampled posts was 0.09
+
+
+def requirements(prompt, done):
+    """What a post must pass before pick() will choose it, as mellea requirements. All plain Python checks,
+    no judge model. done: whether the model ended the post itself, which the text alone can't show."""
+    from mellea import req, simple_validate
+    must = lambda why, fn: req(why, validation_fn=simple_validate(fn))
+    head = prompt[:25]
+    return [must('Ends on its own, not cut off at the length limit', lambda p: done),
+            # opening with the prompt is eval's echo; the paste also lands mid-sentence ("announce that Just got ...")
+            must('Does not paste the prompt in', lambda p: not head or not (p.lower().startswith(head.lower()) or head in p)),
+            must('Does not loop', lambda p: repeats(p) < LOOP),
+            must('At least 100 characters, the shortest post prep keeps', lambda p: len(p) >= 100)]
+
+
+def validate(prompt, ids):
+    """mellea's ValidationResult for each of requirements() on the post ids; it passes if all() of them do."""
+    from mellea import ModelOutputThunk, SimpleContext, mfuncs
+    return mfuncs.validate(requirements(prompt, END in ids), SimpleContext(), None,  # no backend: no judge to call
+                           output=ModelOutputThunk(decode(ids)))
+
+
 def pick(model, prompt, cands):
-    """The candidate the prompt explains best: log p(post | prompt) - log p(post | GENERIC). A fluent but
-    off-topic post is about as likely under either and scores ~0. Plain log p(post | prompt) is worse than
-    not reranking at all (picks short bland posts), and counting prompt words in the post games eval
-    ("about leadership, leadership, and leadership")."""
+    """Of the candidates that pass validate() (all of them, if none do), the one the prompt explains best:
+    log p(post | prompt) - log p(post | GENERIC). A fluent but off-topic post is about as likely under either
+    and scores ~0. Plain log p(post | prompt) is worse than not reranking at all (picks short bland posts),
+    and counting prompt words in the post games eval ("about leadership, leadership, and leadership").
+    Filtering first matters: pasting the prompt in raises log p(post | prompt), so PMI favors echoes."""
     cands = [c[:c.index(END) + 1] if END in c else c for c in cands]  # drop the padding after END
+    cands = [c for c in cands if all(validate(prompt, c))] or cands
     return cands[(logp(model, prompt, cands) - logp(model, GENERIC, cands)).argmax()]
 
 
@@ -587,6 +612,12 @@ def test():
         good = encode('promo', 'I am thrilled to announce...')[len(encode('promo')):]
         junk = tokenizer().encode('hi').ids + [END]
         assert pick(model, 'promo', [junk, good + [END, END]]) == good, 'pick must prefer the trained post'
+        # validate: a real post passes mellea's requirements; one cut off, or with the prompt pasted in, fails
+        say = lambda t, end=(END,): tokenizer().encode(t).ids + list(end)
+        ok = 'So proud to share that I finished my internship at a robotics startup this summer. Grateful to the team!'
+        assert all(validate('Write a post about my internship', say(ok)))
+        assert not all(validate('Write a post about my internship', say(ok, ())))
+        assert not all(validate('Just got promoted to Senior Engineer', say('Excited to say that Just got promoted to Senior Engineer! ' + ok)))
         # load: a saved checkpoint comes back with its own tokenizer and writes the same post
         model.save_pretrained(f'{d}/ck')
         shutil.copy(f'{d}/tok.json', f'{d}/ck/tokenizer.json')
