@@ -47,22 +47,64 @@ Folds every file under `data/raw/` into `data/posts.jsonl`: picks each file's
 real post-text column (see `COLS` in `slm.py` for the couple of files where
 that can't be guessed by name), normalizes Unicode, strips links, drops
 short/long/non-English/duplicate posts, and builds a prompt for each post
-(real prompt column → hashtags as a topic → the post's own first line).
+(real prompt column, half of them as "Write a post about ..." → the post's
+own topic words, never its run-together hashtags).
 
-Check: prints `wrote 198734 posts, 75.7 MB to data/posts.jsonl` (or close to
+Check: prints `wrote 196296 posts, 74.4 MB to data/posts.jsonl` (or close to
 it — a source dataset changing upstream will shift this a little).
 
-## 5. Train
+## 5. Pretrain on general English
 
 ```bash
-.venv/bin/python slm.py train data/posts.jsonl
+.venv/bin/python slm.py pretrain 30000
 ```
 
-Trains its own byte-level BPE tokenizer on this corpus first (8k vocab,
-saved to `data/tokenizer.json`), then a random-init ~13M-param Llama from
-scratch. Cosine LR schedule, early stops after 3 evals (750 iters) with no
-validation improvement. Best-validation checkpoint is saved to `ckpt/`,
-with `ckpt/tokenizer.json` copied alongside it.
+On first run, streams ~1GB of FineWeb-Edu (educational web text) into
+`data/pretrain.jsonl`. Then trains the byte-level BPE tokenizer (8k vocab,
+saved to `data/tokenizer.json`) on the posts plus a tenth of that text, and
+trains a random-init ~13M-param Llama on random 512-token windows of it
+(~250M tokens, about one pass). Best-validation checkpoint is saved to `pre/`.
+About 2-3 hours on a GTX 1660 Ti.
+
+Check: `iter 0` prints a val loss near `ln(8000) ≈ 8.99`, falling to ~5.4 by
+iter 500.
+
+If the run gets cut off (closed terminal, PC sleep), rerun it with the
+iterations that were left, e.g. `pretrain 25000` after dying at iter 5000: it
+sees `pre/` already has a model and continues from those weights and that
+tokenizer (iter 0 then prints the val loss it stopped at, not ~8.99). Only the
+weights carry over; the optimizer and LR schedule start fresh. Delete `pre/` to
+start over from random init.
+
+**Bigger model:** `pretrain [iters] [out] [mb] [size]` picks the output dir, how
+many MB of FineWeb-Edu to stream (into its own `data/pretrain-<mb>.jsonl`), and
+a preset from `SIZES` in `slm.py`:
+
+```bash
+.venv/bin/python slm.py pretrain 73000 pre-30m 2500 30m
+```
+
+That's 29.4M params on ~2.5GB (~650M tokens, about 20 per param). It runs at
+0.63 s/step and peaks at 3.75 GiB of GPU memory on a GTX 1660 Ti (13m: 0.31 s,
+2.4 GiB), so ~14 hours. Fine-tune it with `train`'s 5th argument, the dir to
+start from (next step).
+
+## 6. Fine-tune on the posts
+
+```bash
+.venv/bin/python slm.py train data/posts.jsonl 20000
+```
+
+(A third argument picks the output dir, e.g. `train data/posts.jsonl 20000
+ckpt-v2`, to keep the current `ckpt/` around to compare against with `eval`.
+A fourth picks the pretrained dir to start from, e.g. `train data/posts.jsonl
+20000 ckpt-30m pre-30m`: ~6.5 hours for the 30m size.)
+
+Starts from `pre/` and its tokenizer (without `pre/`, it trains a fresh
+tokenizer on the posts and starts from random init instead). Cosine LR
+schedule, early stops after 6 evals (1500 iters) with no validation
+improvement. Best-validation checkpoint is saved to `ckpt/`, with
+`ckpt/tokenizer.json` copied alongside it.
 
 **Before running:** make sure there's actually free RAM. Check with
 `vm_stat | awk '/Pages free/{print $3}'` — each page is 16KB, so you want a
@@ -72,11 +114,11 @@ system pushes training into swap and it slows to a crawl. Training itself
 pads each batch to a bucketed width rather than its exact size, so it
 shouldn't leak memory over a long run (see README's Notes section).
 
-Check: `iter 0` prints a val loss near `ln(8000) ≈ 8.99` (the model is
-correctly at random-guess entropy before it's learned anything); loss drops
-sharply over the first ~1000 iterations.
+Check: `iter 0` prints a val loss well below `ln(8000) ≈ 8.99` (random-guess
+entropy): the pretrained model already knows English before it has seen a
+single post. From random init it starts right at ~8.99.
 
-## 6. Generate
+## 7. Generate
 
 ```bash
 .venv/bin/python slm.py generate "Write a short LinkedIn post about finishing a machine learning bootcamp"
@@ -84,14 +126,48 @@ sharply over the first ~1000 iterations.
 
 Loads `ckpt/` (model + its matching tokenizer) and samples a post.
 
+## 8. Evaluate
+
+```bash
+.venv/bin/python slm.py eval ckpt my-change
+```
+
+Samples 100 posts (25 fixed prompts x 4) and scores them: on topic, finished,
+repeated trigrams, median words (see README's Evaluating section). Takes under
+a minute on a GPU.
+
+Check: prints one score line and appends a row to `evals/scores.md`. Compare
+it with the `baseline` row there before keeping a change.
+
+## 9. Serve it
+
+```bash
+.venv/bin/python app.py
+```
+
+Check: http://127.0.0.1:7860 shows a prompt box, and a post comes back in a
+few seconds.
+
+To use it away from this machine, put it on a Hugging Face Space:
+
+1. huggingface.co → Settings → Access Tokens → create one with write access.
+2. `.venv/bin/hf auth login` and paste it.
+3. `.venv/bin/python slm.py deploy <your-username>/slm-linked`
+
+Check: it prints the Space's URL; the page there shows "Building", then the
+same prompt box as locally after a few minutes. The Space is private: open it
+while logged in, or pass the token from step 1 to the API (README's Querying
+remotely section). After retraining, run step 3 again.
+
 ## Rebuild order if something's out of sync
 
-`fetch` → `prep` → `train` → `generate`, always in that order — each step's
-output is the next step's input. If you edit `slm.py`'s cleaning/column logic,
-rerun from `prep`. If you add a new source, rerun from `fetch`.
+`fetch` → `prep` → `pretrain` → `train` → `generate` (or `deploy`), always in that order —
+each step's output is the next step's input. If you edit `slm.py`'s
+cleaning/column logic, rerun from `prep`. If you add a new source, rerun from
+`fetch`. To only retune on the posts, rerun `train`: `pre/` stays valid.
 
 ## What's intentionally not in git
 
-`.venv/`, `data/`, `ckpt/` — all rebuilt by the steps above, not committed.
+`.venv/`, `data/`, `pre/`, `ckpt/` — all rebuilt by the steps above, not committed.
 `data/posts.jsonl` alone is ~90MB, well past what belongs in a git repo for
 something this reproducible.

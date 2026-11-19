@@ -1,0 +1,6 @@
+# the Space is CPU-only: the CPU torch wheel is a fraction of the default CUDA one's size
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+transformers==5.17.0
+tokenizers
+mellea==0.8.0  # slm.validate; its API still moves between 0.x releases
