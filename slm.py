@@ -361,6 +361,9 @@ COLS = {  # files whose real (post, prompt) columns the name heuristic cannot gu
 
 
 ABOUT = ('Write a LinkedIn post about ', 'Write a post about ')
+# its 'linkedin' column is LLM-rewritten corporate-speak (the real post is the truncated 'preview'), and it is
+# 86% of the corpus: the model's stock phrasing (30% of posts vs 9% of the human ones) is its voice
+MACHINE = {'english-linkedin-posts-v2.csv'}
 
 
 def keywords(posts, k=3):
@@ -383,8 +386,9 @@ def related(prompt, post):
     return bool(stem(prompt) & stem(post))
 
 
-def prep(src='data/raw', out='data/posts.jsonl', min_chars=100, max_chars=6000, max_per_prompt=5):
-    """Fold every csv/json/jsonl/parquet under src into one deduped posts.jsonl."""
+def prep(src='data/raw', out='data/posts.jsonl', min_chars=100, max_chars=6000, max_per_prompt=5, machine_share=None):
+    """Fold every csv/json/jsonl/parquet under src into one deduped posts.jsonl. machine_share: downsample
+    the MACHINE files' posts to at most that share of it (None keeps them all)."""
     import pandas as pd
     per_prompt = collections.Counter()
     reader = {'.csv': pd.read_csv, '.tsv': lambda p: pd.read_csv(p, sep='\t'),
@@ -434,9 +438,17 @@ def prep(src='data/raw', out='data/posts.jsonl', min_chars=100, max_chars=6000, 
                     continue
                 per_prompt[cap] += 1
                 seen.update((key, tail))
-                kept.append({'prompt': None if bad else p[:300], 'post': post})
+                kept.append({'prompt': None if bad else p[:300], 'post': post, 'machine': f.name in MACHINE})
                 n += 1
         print(f'{f.name}: {n} posts from {col!r}' + (f', prompts from {pcol!r}' if pcol else ''))
+    if machine_share is not None:
+        mach = [i for i, r in enumerate(kept) if r['machine']]
+        k = int((len(kept) - len(mach)) * machine_share / (1 - machine_share))
+        drop = set(mach) - set(random.Random(0).sample(mach, min(k, len(mach))))
+        kept = [r for i, r in enumerate(kept) if i not in drop]
+        print(f'machine_share {machine_share}: kept {len(mach) - len(drop)} of {len(mach)} {"/".join(MACHINE)} posts')
+    for r in kept:
+        del r['machine']
     # Prompts in the shape people type them. A post without a real prompt gets its most distinctive words:
     # its hashtags used to fill in, and taught the model that what follows "Write a LinkedIn post about" is a
     # run-together tag list to copy (#finishinginternship); its first line taught it to echo the prompt.
@@ -515,8 +527,9 @@ def train(path, iters=5000, cfg=CFG, batch=16, lr=3e-4, out='ckpt', init='pre'):
     return fit(model, lambda: batch_of(tr, batch), vb, iters, lr, out)
 
 
-def fit(model, get, vb, iters, lr, out):
-    """AdamW on a cosine schedule; every 250 iters, eval on the fixed val batches vb and keep the best in out/."""
+def fit(model, get, vb, iters, lr, out, patience=6):
+    """AdamW on a cosine schedule; every 250 iters, eval on the fixed val batches vb and keep the best in out/.
+    Stop after patience evals without improvement (None: never)."""
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
     sched = get_cosine_schedule_with_warmup(opt, 100, iters)
     best, stale = float('inf'), 0
@@ -532,7 +545,7 @@ def fit(model, get, vb, iters, lr, out):
                 model.save_pretrained(out)
             else:
                 stale += 1
-                if stale == 6:  # 6 evals (1500 iters) without improvement: it is overfitting, stop
+                if stale == patience:  # 6 evals (1500 iters) without improvement: it is overfitting, stop
                     print(f'early stop at {it}, best val {best:.3f}')
                     break
         x, y = get()
@@ -601,7 +614,9 @@ def pretrain(iters=30000, src=None, posts='data/posts.jsonl', out='pre', batch=1
     pathlib.Path(out).mkdir(parents=True, exist_ok=True)
     if not resume:
         shutil.copy(TOK_PATH, f'{out}/tokenizer.json')
-    return fit(model, lambda: window(tr), [window(va) for _ in range(64)], iters, lr, out)
+    # no early stop: under one pass over the text it can't overfit, and a resumed run's LR warmup bumps val
+    # loss up (3.501 -> 3.518 resuming pre-30m/), and 1500 iters may not be enough to recover from that
+    return fit(model, lambda: window(tr), [window(va) for _ in range(64)], iters, lr, out, patience=None)
 
 
 def test():
@@ -618,6 +633,13 @@ def test():
                                   long.replace('cloud', 'data') + ' #cloud #data']}).to_csv(f'{d}/raw.csv', index=False)
         prep(d, f'{d}/posts.jsonl')
         rows = load_rows(f'{d}/posts.jsonl')
+        # machine_share: 6 MACHINE posts next to 2 human ones, cut to half the corpus -> 2 of them stay
+        pathlib.Path(f'{d}/posts.jsonl').unlink()  # else the next prep reads it back in as a source
+        fake = [f'Machine post {i}: leveraging synergy and cross-functional alignment for every single stakeholder in the org, item {i}.' for i in range(6)]
+        pd.DataFrame({'english': [f'synergy note {i}' for i in range(6)], 'linkedin': fake}).to_csv(f'{d}/{min(MACHINE)}', index=False)
+        prep(d, f'{d}/bal.jsonl', machine_share=0.5)
+        bal = load_rows(f'{d}/bal.jsonl')
+        assert len(bal) == 4 and sum(r['post'] in fake for r in bal) == 2 and set(bal[0]) == {'prompt', 'post'}, bal
     assert len(rows) == 2, rows                      # dupe, short and Russian dropped
     assert 'http' not in rows[0]['post'] and 'see more' not in rows[0]['post'], rows[0]
     assert rows[0]['prompt'].endswith('opic: cloud certification'), rows[0]  # real prompt, maybe "Write a post about"
@@ -708,7 +730,7 @@ if __name__ == '__main__':
     elif cmd == 'fetch':
         fetch(*sys.argv[2:])
     elif cmd == 'prep':
-        prep(*sys.argv[2:])
+        prep(*sys.argv[2:4], machine_share=float(sys.argv[4]) if len(sys.argv) > 4 else None)
     elif cmd == 'eval':
         evaluate(*sys.argv[2:])
     elif cmd == 'deploy':

@@ -80,13 +80,19 @@ Training data format, one JSON object per line:
 
 Current corpus: **~196k posts, 74MB**: about a third bare real prompts, a
 third real prompts as "Write a post about ...", a third topic-word prompts. Kaggle's `mozharovartem/english-linkedin-posts`
-(plain-English ↔ LinkedIn-speak pairs) is 85% of it, so the corpus currently
+(plain-English ↔ LinkedIn-speak pairs) is 86% of it, so the corpus currently
 skews toward that dataset's machine-generated corporate voice; the influencer
-and scraped sources are the more authentic human-voice slice.
+and scraped sources are the more authentic human-voice slice. That file's
+`linkedin` column is an LLM rewrite of its `preview` column, the real post,
+which is too short to train on (median 153 chars, a fifth cut off with "...").
+`slm.py prep data/raw data/posts-bal.jsonl 0.5` downsamples it (`MACHINE`) to
+half the corpus: ~54k posts in place of ~196k.
 
 Kaggle and HF have both been swept fairly exhaustively for English LinkedIn
 *post* text (not job listings, not profile data) — see `SOURCES` /
-`KAGGLE_SOURCES` for what survived. Beyond this, more data means a licensed
+`KAGGLE_SOURCES` for what survived. A re-sweep of HF in 2026-11 found nothing
+worth adding: the new sets are tiny (≤150 rows), non-English, templated, or
+Q&A about LinkedIn instead of posts. Beyond this, more data means a licensed
 scraping API (Bright Data, Apify, ...) or personal/team LinkedIn exports.
 Do not scrape LinkedIn directly — it breaks their ToS.
 
@@ -184,5 +190,7 @@ opening its page wakes it, which takes a minute or so.
   not to a fixed max — padding every batch to its own exact width thrashes
   MPS's memory allocator over a long run (fills swap, brings the run to a
   crawl). Bucketing keeps the shape count small enough to cache.
-- Early stopping: training halts after 6 evals (1500 iters) with no
-  validation improvement.
+- Early stopping: `train` halts after 6 evals (1500 iters) with no
+  validation improvement. `pretrain` never stops early: it can't overfit in
+  under one pass over its text, and a resumed run's LR warmup bumps val loss
+  up for a while.

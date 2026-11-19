@@ -5,7 +5,7 @@ data/
 __pycache__/
 *.pyc
 .DS_Store
-pre/
+pre*/
 ckpt-scratch/
 *.log
 ckpt*/
